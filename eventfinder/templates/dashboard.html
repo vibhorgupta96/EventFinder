@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EventFinder</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+    <script defer src="{{ url_for('static', path='dashboard.js') }}"></script>
+  </head>
+  <body>
+    <header class="hero">
+      <div><p class="eyebrow">LOCAL · READ-ONLY</p><h1>EventFinder</h1></div>
+      <p>Technical talks, hands-on events, and hackathons in Bengaluru — plus trusted global online sessions.</p>
+    </header>
+    <main>
+      <form id="filter-form" class="filters" aria-label="Filter events">
+        <label>Search <input name="text" placeholder="AI, Kubernetes, security…"></label>
+        <label>Topic <input name="topic" placeholder="machine learning"></label>
+        <label>Type <select name="event_type"><option value="">All</option><option>talk</option><option>meetup</option><option>workshop</option><option>conference</option><option>hackathon</option><option>buildathon</option><option>competition</option></select></label>
+        <label>Organizer <input name="organizer" placeholder="Google, AWS…"></label>
+        <label>Format <select name="format"><option value="">All</option><option value="in_person">In person</option><option value="online">Online</option><option value="hybrid">Hybrid</option></select></label>
+        <label>Registration <select name="registration_state"><option value="">All</option><option value="open">Open</option><option value="waitlist">Waitlist</option><option value="closed">Closed</option></select></label>
+        <label>From <input name="start_after" type="date"></label>
+        <label>To <input name="start_before" type="date"></label>
+        <label>Source <input name="source" placeholder="Luma, GDG…"></label>
+        <button type="submit">Filter</button><button type="reset" class="secondary">Reset</button>
+      </form>
+      <section id="filter-results" hidden><h2>Filtered events</h2><div class="cards"></div></section>
+
+      {% for name, events in sections.items() %}
+      <section class="event-section">
+        <h2>{{ name }} <span>{{ events | length }}</span></h2>
+        {% if events %}
+        <div class="cards">
+          {% for event in events %}
+          <article class="card">
+            <div class="card-top"><p class="type">{{ event.event_type | replace('_', ' ') }}</p><p class="state">{{ event.registration_state | replace('_', ' ') }}</p></div>
+            <h3><a href="{{ event.official_url }}" target="_blank" rel="noopener noreferrer">{{ event.title }}</a></h3>
+            {% if event.organizer %}<p class="organizer">{{ event.organizer }}</p>{% endif %}
+            <p class="when">{{ event.starts_at_ist or 'Time not stated' }}</p>
+            <p>{{ event.venue or event.city or ('Online' if event.format == 'online' else 'Venue not stated') }}</p>
+            {% if event.summary %}<p class="summary">{{ event.summary }}</p>{% endif %}
+            <div class="badges">
+              <span>{{ event.format | replace('_', ' ') }}</span>
+              <span>{{ 'Free' if event.price_status == 'free' else 'Price not stated' if event.price_status == 'not_stated' else event.price_text }}</span>
+              {% if event.approval_required %}<span>Approval required</span>{% endif %}
+              {% for topic in event.topics[:3] %}<span>{{ topic }}</span>{% endfor %}
+            </div>
+            {% if event.speakers %}<p class="small">Speakers: {{ event.speakers | join(', ') }}</p>{% endif %}
+            {% if event.registration_deadline %}<p class="small">Registration deadline: {{ event.registration_deadline_ist }}</p>{% endif %}
+            <p class="small">Why: {{ event.relevance_reason }}</p>
+            <p class="small">Sources: {% for source in event.source_urls %}<a href="{{ source }}" target="_blank" rel="noopener noreferrer">{{ loop.index }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+            <a class="registration" href="{{ event.registration_url or event.official_url }}" target="_blank" rel="noopener noreferrer">View registration ↗</a>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}<p class="empty">Nothing to show yet.</p>{% endif %}
+      </section>
+      {% endfor %}
+
+      <section class="event-section"><h2>Source health <span>{{ source_health | length }}</span></h2>
+        <div class="source-grid">{% for source in source_health %}<article class="source {{ source.status }}"><h3>{{ source.source_name }}</h3><p>{{ source.status }}</p><p class="small">{{ source.accepted_count }} accepted · {{ source.fetched_count }} fetched</p>{% if source.error %}<p class="small">{{ source.error }}</p>{% endif %}</article>{% else %}<p class="empty">No source run has completed.</p>{% endfor %}</div>
+      </section>
+    </main>
+  </body>
+</html>

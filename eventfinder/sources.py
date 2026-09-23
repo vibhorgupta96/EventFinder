@@ -1,0 +1,799 @@
+"""Respectful public-source adapters with URL safety, robots, and factual extraction."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+from abc import ABC, abstractmethod
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
+from zoneinfo import ZoneInfo
+
+import httpx
+from bs4 import BeautifulSoup
+from dateutil import parser as date_parser
+from ddgs import DDGS
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from eventfinder.config import SourceDefinition, get_settings
+from eventfinder.domain import (
+    EventCandidate,
+    EventFormat,
+    EventType,
+    FetchResult,
+    RegistrationState,
+    SourceEvidence,
+    has_explicit_paid_price,
+)
+from eventfinder.urls import UnsafeURL, URLSafety
+
+USER_AGENT = "EventFinder/0.1 (+local read-only technical event discovery)"
+ROBOTS_TTL = timedelta(hours=6)
+MAX_REDIRECTS = 5
+PLATFORM_CARD_SELECTORS = {
+    "luma": "[data-event], [class*='event-card'], a[href*='/event/']",
+    "meetup": "[data-event-id], [data-testid*='event'], [class*='event-card']",
+    "hasgeek": "article, [class*='event-card'], [data-event]",
+    "devfolio": "[data-hackathon], [class*='hackathon-card'], [class*='event-card']",
+    "unstop": "[data-opportunity-id], [class*='opportunity-card'], [class*='event-card']",
+    "eventbrite": "[data-event-id], [class*='event-card'], article",
+    "official": "[data-event], [class*='event-card'], article",
+}
+
+
+class SourceFetchError(RuntimeError):
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class RequestLimiter:
+    """Injectable per-origin cadence limiter for every source page request."""
+
+    def __init__(self, sleeper=asyncio.sleep, clock=time.monotonic):
+        self.sleeper = sleeper
+        self.clock = clock
+        self._next_allowed: dict[str, float] = {}
+
+    async def wait(self, url: str, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        origin = f"{urlsplit(url).scheme}://{urlsplit(url).netloc}"
+        now = self.clock()
+        delay = max(0.0, self._next_allowed.get(origin, now) - now)
+        if delay:
+            await self.sleeper(delay)
+        self._next_allowed[origin] = self.clock() + seconds
+
+
+def _allowed_destination(url: str, allowed_domains: set[str] | None) -> bool:
+    if not allowed_domains:
+        return False
+    hostname = (urlsplit(url).hostname or "").casefold()
+    return any(hostname == domain or hostname.endswith(f".{domain}") for domain in allowed_domains)
+
+
+def _is_interstitial(text: str) -> bool:
+    return bool(re.search(r"captcha|verify you are human|access denied|checking your browser", text, re.I))
+
+
+class EventSource(ABC):
+    def __init__(
+        self,
+        definition: SourceDefinition,
+        client: httpx.AsyncClient,
+        robots_policy: RobotsPolicy | None = None,
+        safety: URLSafety | None = None,
+        limiter: RequestLimiter | None = None,
+    ):
+        self.definition = definition
+        self.client = client
+        self.safety = safety or URLSafety()
+        self.robots_policy = robots_policy or RobotsPolicy(client, self.safety)
+        self.limiter = limiter or RequestLimiter()
+        self.allowed_domains = {domain.casefold() for domain in definition.allowed_domains}
+        if definition.url and (hostname := urlsplit(definition.url).hostname):
+            self.allowed_domains.add(hostname.casefold())
+
+    @abstractmethod
+    async def fetch(self) -> FetchResult:
+        raise NotImplementedError
+
+    async def validated_candidates(self, candidates: list[EventCandidate]) -> list[EventCandidate]:
+        """Keep only candidates whose displayed destinations are public and robots-allowed."""
+        safe: list[EventCandidate] = []
+        for candidate in candidates:
+            try:
+                candidate.canonical_url = await self.safety.validate(candidate.canonical_url)
+                # A source listing may link elsewhere for registration, but its
+                # event page must stay on the configured public source boundary.
+                # Registration URLs are display-only and handled separately.
+                if not _allowed_destination(candidate.canonical_url, self.allowed_domains):
+                    continue
+                if not await self.robots_policy.allows(
+                    candidate.canonical_url, self.allowed_domains
+                ):
+                    continue
+                if candidate.registration_url:
+                    try:
+                        candidate.registration_url = await self.safety.validate(candidate.registration_url)
+                    except UnsafeURL:
+                        # Keep the factual event, but never expose a destination that
+                        # failed the same outbound-link safety boundary.
+                        candidate.registration_url = None
+            except UnsafeURL:
+                continue
+            safe.append(candidate)
+        return safe
+
+
+class RobotsPolicy:
+    """Caches RobotFileParsers by origin and checks every requested path."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        safety: URLSafety | None = None,
+        ttl: timedelta = ROBOTS_TTL,
+    ):
+        self.client = client
+        self.safety = safety or URLSafety()
+        self.ttl = ttl
+        self._cache: dict[str, tuple[RobotFileParser, datetime]] = {}
+
+    async def allows(self, url: str, allowed_domains: set[str] | None = None) -> bool:
+        safe_url = await self.safety.validate(url)
+        if allowed_domains is not None and not _allowed_destination(safe_url, allowed_domains):
+            return False
+        parsed = urlsplit(safe_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        cached = self._cache.get(origin)
+        if cached is None or cached[1] <= datetime.now(UTC):
+            parser = await self._load(origin, allowed_domains)
+            if parser is None:
+                return False
+            self._cache[origin] = (parser, datetime.now(UTC) + self.ttl)
+        return self._cache[origin][0].can_fetch(USER_AGENT, safe_url)
+
+    async def _load(
+        self, origin: str, allowed_domains: set[str] | None = None
+    ) -> RobotFileParser | None:
+        try:
+            response = await _request_redirect_checked(
+                self.client,
+                f"{origin}/robots.txt",
+                self.safety,
+                allowed_domains=allowed_domains,
+            )
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code != 404:
+                return None
+            parser = RobotFileParser()
+            parser.parse(["User-agent: *", "Allow: /"])
+            return parser
+        except (httpx.HTTPError, SourceFetchError, UnsafeURL):
+            return None
+        parser = RobotFileParser()
+        parser.parse(response.text.splitlines())
+        return parser
+
+
+@retry(
+    retry=retry_if_exception_type(httpx.TransportError),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+async def _request_redirect_checked(
+    client: httpx.AsyncClient,
+    url: str,
+    safety: URLSafety,
+    robots_policy: RobotsPolicy | None = None,
+    allowed_domains: set[str] | None = None,
+    limiter: RequestLimiter | None = None,
+    rate_limit_seconds: float = 0,
+) -> httpx.Response:
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        current = await safety.validate(current)
+        if allowed_domains is not None and not _allowed_destination(current, allowed_domains):
+            raise SourceFetchError("destination is outside this source's allowed domains")
+        if robots_policy and not await robots_policy.allows(current, allowed_domains):
+            raise SourceFetchError("robots policy disallows this URL")
+        if limiter:
+            await limiter.wait(current, rate_limit_seconds)
+        response = await client.get(current, headers={"User-Agent": USER_AGENT}, follow_redirects=False)
+        if response.status_code == 429:
+            raise SourceFetchError("rate limited; source paused", status_code=429)
+        if response.status_code in {401, 403}:
+            raise SourceFetchError("source denied public access", status_code=response.status_code)
+        if response.is_redirect:
+            location = response.headers.get("location")
+            if not location:
+                raise SourceFetchError("redirect missing location", status_code=response.status_code)
+            current = urljoin(current, location)
+            continue
+        response.raise_for_status()
+        return response
+    raise SourceFetchError("too many redirects")
+
+
+def _listing_urls(definition: SourceDefinition) -> list[str]:
+    assert definition.url
+    urls = [definition.url]
+    if definition.max_pages > 1 and definition.pagination_param:
+        parsed = urlsplit(definition.url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        for page in range(2, definition.max_pages + 1):
+            urls.append(
+                urlunsplit(
+                    (
+                        parsed.scheme,
+                        parsed.netloc,
+                        parsed.path,
+                        urlencode({**query, definition.pagination_param: str(page)}),
+                        "",
+                    )
+                )
+            )
+    return urls
+
+
+class PublicPageEventSource(EventSource):
+    async def fetch(self) -> FetchResult:
+        observed_at = datetime.now(UTC)
+        candidates: list[EventCandidate] = []
+        evidence: list[SourceEvidence] = []
+        seen: set[str] = set()
+        for listing_url in _listing_urls(self.definition):
+            response = await _request_redirect_checked(
+                self.client,
+                listing_url,
+                self.safety,
+                self.robots_policy,
+                self.allowed_domains,
+                self.limiter,
+                self.definition.rate_limit_seconds,
+            )
+            if _is_interstitial(response.text):
+                raise SourceFetchError("source returned CAPTCHA or interstitial")
+            parsed = parse_event_page(
+                response.text,
+                str(response.url),
+                self.definition.name,
+                observed_at,
+                self.definition.platform,
+            )
+            for candidate in await self.validated_candidates(parsed):
+                if candidate.canonical_url not in seen:
+                    candidates.append(candidate)
+                    seen.add(candidate.canonical_url)
+            evidence.append(
+                SourceEvidence(
+                    source_name=self.definition.name,
+                    source_url=str(response.url),
+                    observed_at=observed_at,
+                    facts={
+                        "parser": f"{self.definition.platform or 'generic'}:json+html",
+                        "candidate_count": len(parsed),
+                    },
+                )
+            )
+        return FetchResult(candidates=candidates, source_evidence=evidence)
+
+
+class SearchEventSource(EventSource):
+    """Hydrates each safe destination; a search snippet never becomes an event by itself."""
+
+    async def fetch(self) -> FetchResult:
+        if not self.definition.query:
+            return FetchResult()
+        try:
+            results = await asyncio.to_thread(
+                lambda: list(DDGS().text(self.definition.query, max_results=12))
+            )
+        except Exception as error:  # ddgs has no stable typed exception surface
+            results = await self._fallback_results(self.definition.query, error)
+        observed_at = datetime.now(UTC)
+        candidates: list[EventCandidate] = []
+        evidence: list[SourceEvidence] = []
+        seen: set[str] = set()
+        for result in results:
+            destination = result.get("href") or result.get("url")
+            if not destination:
+                continue
+            try:
+                response = await _request_redirect_checked(
+                    self.client,
+                    destination,
+                    self.safety,
+                    self.robots_policy,
+                    self.allowed_domains,
+                    self.limiter,
+                    self.definition.rate_limit_seconds,
+                )
+            except (httpx.HTTPError, SourceFetchError, UnsafeURL) as error:
+                evidence.append(
+                    SourceEvidence(
+                        source_name=self.definition.name,
+                        source_url=destination,
+                        observed_at=observed_at,
+                        facts={"parser": "search_hydration", "rejected": str(error)},
+                    )
+                )
+                continue
+            if _is_interstitial(response.text):
+                evidence.append(
+                    SourceEvidence(
+                        source_name=self.definition.name,
+                        source_url=str(response.url),
+                        observed_at=observed_at,
+                        facts={"parser": "search_hydration", "rejected": "captcha or interstitial"},
+                    )
+                )
+                continue
+            parsed = parse_event_page(
+                response.text,
+                str(response.url),
+                self.definition.name,
+                observed_at,
+                self.definition.platform,
+            )
+            for candidate in await self.validated_candidates(parsed):
+                if candidate.canonical_url not in seen:
+                    candidates.append(candidate)
+                    seen.add(candidate.canonical_url)
+            evidence.append(
+                SourceEvidence(
+                    source_name=self.definition.name,
+                    source_url=str(response.url),
+                    observed_at=observed_at,
+                    facts={"parser": "search_hydration", "candidate_count": len(parsed)},
+                )
+            )
+        return FetchResult(candidates=candidates, source_evidence=evidence)
+
+    async def _fallback_results(self, query: str, ddgs_error: Exception) -> list[dict[str, str]]:
+        settings = get_settings()
+        providers = (
+            (settings.serper_api_key, self._search_serper),
+            (settings.brave_search_api_key, self._search_brave),
+            (settings.tavily_api_key, self._search_tavily),
+            (settings.exa_api_key, self._search_exa),
+        )
+        errors = [f"ddgs: {ddgs_error}"]
+        for key, search in providers:
+            if not key:
+                continue
+            try:
+                return await search(query, key)
+            except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
+                errors.append(str(error))
+        raise SourceFetchError("search unavailable: " + "; ".join(errors))
+
+    async def _search_serper(self, query: str, key: str) -> list[dict[str, str]]:
+        response = await self.client.post("https://google.serper.dev/search", headers={"X-API-KEY": key}, json={"q": query, "num": 12})
+        response.raise_for_status()
+        return [{"href": x["link"]} for x in response.json().get("organic", []) if x.get("link")]
+
+    async def _search_brave(self, query: str, key: str) -> list[dict[str, str]]:
+        response = await self.client.get("https://api.search.brave.com/res/v1/web/search", headers={"X-Subscription-Token": key}, params={"q": query, "count": 12})
+        response.raise_for_status()
+        return [{"href": x["url"]} for x in response.json().get("web", {}).get("results", []) if x.get("url")]
+
+    async def _search_tavily(self, query: str, key: str) -> list[dict[str, str]]:
+        response = await self.client.post("https://api.tavily.com/search", json={"api_key": key, "query": query, "max_results": 12})
+        response.raise_for_status()
+        return [{"href": x["url"]} for x in response.json().get("results", []) if x.get("url")]
+
+    async def _search_exa(self, query: str, key: str) -> list[dict[str, str]]:
+        response = await self.client.post("https://api.exa.ai/search", headers={"x-api-key": key}, json={"query": query, "numResults": 12})
+        response.raise_for_status()
+        return [{"href": x["url"]} for x in response.json().get("results", []) if x.get("url")]
+
+
+def make_source(
+    definition: SourceDefinition,
+    client: httpx.AsyncClient,
+    robots_policy: RobotsPolicy | None = None,
+    safety: URLSafety | None = None,
+    limiter: RequestLimiter | None = None,
+) -> EventSource:
+    if definition.adapter == "public_page":
+        return PublicPageEventSource(definition, client, robots_policy, safety, limiter)
+    if definition.adapter == "search":
+        return SearchEventSource(definition, client, robots_policy, safety, limiter)
+    raise ValueError(f"unsupported source adapter: {definition.adapter}")
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value] if value is not None else []
+
+
+def _text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return " ".join(value.split()) or None
+    if isinstance(value, dict):
+        return _text(value.get("name") or value.get("title") or value.get("@id"))
+    return None
+
+
+def _parse_time(value: Any) -> datetime | None:
+    text = _text(value)
+    if not text:
+        return None
+    try:
+        parsed = date_parser.isoparse(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+    return parsed.astimezone(UTC)
+
+
+def _json_nodes(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        nodes = [value]
+        for key in ("@graph", "events", "data", "results", "items", "edges"):
+            child = value.get(key)
+            if isinstance(child, (dict, list)):
+                nodes.extend(_json_nodes(child))
+        return nodes
+    if isinstance(value, list):
+        return [node for item in value for node in _json_nodes(item)]
+    return []
+
+
+def _location(value: Any) -> tuple[str | None, str | None, str | None]:
+    if isinstance(value, str):
+        city = "Bengaluru" if re.search(r"\bbangal(?:ore|uru)\b", value, re.I) else None
+        return value, city, None
+    if not isinstance(value, dict):
+        return None, None, None
+    address = value.get("address") if isinstance(value.get("address"), dict) else value
+    return (_text(value.get("name")) or _text(address.get("streetAddress")), _text(address.get("addressLocality") or address.get("city")), _text(address.get("addressCountry") or address.get("country")))
+
+
+def _event_type(title: str, description: str) -> EventType:
+    text = f"{title} {description}".casefold()
+    pairs = (("buildathon", EventType.BUILDATHON), ("hackathon", EventType.HACKATHON), ("competition", EventType.COMPETITION), ("challenge", EventType.COMPETITION), ("workshop", EventType.WORKSHOP), ("hands-on", EventType.WORKSHOP), ("conference", EventType.CONFERENCE), ("summit", EventType.CONFERENCE), ("meetup", EventType.MEETUP))
+    for needle, event_type in pairs:
+        if needle in text:
+            return event_type
+    return EventType.TALK if any(x in text for x in ("talk", "speaker", "session", "webinar")) else EventType.UNKNOWN
+
+
+def _registration_state(text: str) -> RegistrationState:
+    lowered = text.casefold()
+    if lowered.strip() in {"open", "registration_open", "registration open"}:
+        return RegistrationState.OPEN
+    if re.search(r"\bcancel(?:led|ed|lation)?\b", lowered):
+        return RegistrationState.CANCELLED
+    if "postpon" in lowered:
+        return RegistrationState.POSTPONED
+    if "sold out" in lowered:
+        return RegistrationState.SOLD_OUT
+    if "almost full" in lowered:
+        return RegistrationState.OPEN
+    if "waitlist" in lowered:
+        return RegistrationState.WAITLIST
+    if re.search(r"\b(?:registration(?:s)? (?:are|have|is) )?closed\b", lowered) or "ended" in lowered:
+        return RegistrationState.CLOSED
+    return (
+        RegistrationState.OPEN
+        if re.search(
+            r"\b(register|registration(?:s)? (?:are )?(?:now )?open(?:ed)?|rsvp|apply now|tickets? available)\b",
+            lowered,
+        )
+        else RegistrationState.UNKNOWN
+    )
+
+
+def _offer_values(offers: Any) -> tuple[str | None, str | None, str | None, datetime | None]:
+    for offer in _as_list(offers):
+        if isinstance(offer, str):
+            return offer, None, None, None
+        if isinstance(offer, dict):
+            price = _text(offer.get("price") or offer.get("amount") or offer.get("fee"))
+            currency = _text(offer.get("priceCurrency") or offer.get("currency"))
+            url = _text(offer.get("url") or offer.get("checkoutUrl"))
+            availability = _text(offer.get("availability"))
+            valid_from = _parse_time(offer.get("validFrom"))
+            return (f"{currency or ''} {price}".strip() if price else None), url, availability, valid_from
+    return None, None, None, None
+
+
+def _schema_registration_state(event_status: Any, availability: str | None) -> RegistrationState:
+    status = _text(event_status) or ""
+    availability_text = availability or ""
+    combined = f"{status} {availability_text}".casefold()
+    if "eventcancelled" in combined or "cancel" in combined:
+        return RegistrationState.CANCELLED
+    if "postpon" in combined:
+        return RegistrationState.POSTPONED
+    if "soldout" in combined or "outofstock" in combined:
+        return RegistrationState.SOLD_OUT
+    if "discontinued" in combined or "closed" in combined or "ended" in combined:
+        return RegistrationState.CLOSED
+    if "instock" in combined or "preorder" in combined:
+        return RegistrationState.OPEN
+    return RegistrationState.UNKNOWN
+
+
+def _is_paid(price: str | None) -> bool:
+    return has_explicit_paid_price(price)
+
+
+def _format(value: Any, venue: str | None, is_online: Any = None) -> EventFormat:
+    text = " ".join(filter(None, [_text(value) or "", venue or "", str(is_online or "")])).casefold()
+    if "hybrid" in text or "mixed" in text:
+        return EventFormat.HYBRID
+    if "online" in text or "virtual" in text or str(is_online).casefold() == "true":
+        return EventFormat.ONLINE
+    return EventFormat.IN_PERSON if venue else EventFormat.UNKNOWN
+
+
+def _local_datetime(node: dict[str, Any], prefix: str) -> str | None:
+    """Combine documented Meetup-style local date/time fields when present."""
+
+    date = _text(node.get(f"{prefix}_date") or node.get(f"{prefix}Date"))
+    time = _text(node.get(f"{prefix}_time") or node.get(f"{prefix}Time"))
+    return f"{date}T{time}" if date and time else date
+
+
+def _candidate_from_mapping(node: dict[str, Any], page_url: str, source_name: str, observed_at: datetime, parser_name: str) -> EventCandidate | None:
+    title = _text(node.get("name") or node.get("title") or node.get("eventName"))
+    start = _parse_time(
+        node.get("startDate")
+        or node.get("start_time")
+        or node.get("startTime")
+        or node.get("starts_at")
+        or node.get("start_at")
+        or node.get("startAt")
+        or node.get("start")
+        or _local_datetime(node, "local")
+    )
+    kind = node.get("@type") or node.get("type") or ""
+    if not title or not ("event" in str(kind).casefold() or start or node.get("registrationDeadline")):
+        return None
+    description = _text(node.get("description") or node.get("summary") or node.get("about") or node.get("blurb")) or ""
+    event_url = _text(node.get("url") or node.get("eventUrl") or node.get("event_url") or node.get("permalink") or node.get("link")) or page_url
+    venue, city, country = _location(
+        node.get("location") or node.get("venue") or node.get("geo_address_info") or {"city": node.get("city")}
+    )
+    price, offer_url, offer_availability, offer_valid_from = _offer_values(
+        node.get("offers") or node.get("ticket") or node.get("pricing") or node.get("tickets")
+    )
+    price = price or _text(node.get("price") or node.get("fee") or node.get("price_text"))
+    registration_url = _text(node.get("registrationUrl") or node.get("registration_url") or node.get("registrationLink") or node.get("registerUrl") or node.get("applyUrl") or node.get("actionUrl")) or offer_url or event_url
+    eligibility = _text(node.get("eligibility") or node.get("eligibility_text") or node.get("eligibilityText") or node.get("audience") or node.get("requirements"))
+    speakers = [name for item in _as_list(node.get("performer") or node.get("speakers") or node.get("speaker") or node.get("presenters")) if (name := _text(item))]
+    explicit_registration_status = _text(
+        node.get("registrationStatus") or node.get("registration_state") or node.get("eventStatus")
+    )
+    if explicit_registration_status is None and node.get("isRegistrationOpen") is True:
+        explicit_registration_status = "open"
+    state_text = " ".join(
+        filter(
+            None,
+            [
+                title,
+                description,
+                explicit_registration_status,
+                price,
+            ],
+        )
+    )
+    evidence = SourceEvidence(source_name=source_name, source_url=page_url, observed_at=observed_at, raw_id=_text(node.get("@id") or node.get("id")), facts={"parser": parser_name, "event": node})
+    schema_state = _schema_registration_state(node.get("eventStatus"), offer_availability)
+    parsed_state = _registration_state(explicit_registration_status) if explicit_registration_status else _registration_state(state_text)
+    return EventCandidate(
+        title=title, canonical_url=urljoin(page_url, event_url), source_url=page_url, source_name=source_name,
+        organizer=_text(node.get("organizer") or node.get("host") or node.get("organization") or node.get("organizerName")), description=description,
+        starts_at=start, ends_at=_parse_time(node.get("endDate") or node.get("end_time") or node.get("endTime") or node.get("ends_at") or node.get("end_at") or node.get("endAt") or _local_datetime(node, "local_end")),
+        venue=venue, city=city, country=country, format=_format(node.get("eventAttendanceMode") or node.get("format") or node.get("event_format") or node.get("mode"), venue, node.get("isOnline") or node.get("is_online")),
+        event_type=_event_type(title, description), registration_state=(
+            schema_state if schema_state != RegistrationState.UNKNOWN else parsed_state
+        ), registration_url=urljoin(page_url, registration_url),
+        registration_deadline=_parse_time(node.get("registrationDeadline") or node.get("registration_deadline") or node.get("registration_closes_at") or node.get("applicationDeadline") or node.get("deadline")),
+        registration_opened_at=_parse_time(node.get("registrationOpenedAt") or node.get("registration_opened_at") or node.get("registration_opened") or node.get("registrationOpenDate") or node.get("registrationDate")) or offer_valid_from,
+        price_text=price, is_explicitly_paid=_is_paid(price), eligibility_text=eligibility, speakers=speakers,
+        topics=[topic for topic in _as_list(node.get("topics") or node.get("tags") or node.get("categories")) if isinstance(topic, str)], evidence=evidence,
+    )
+
+
+def _html_card_candidates(soup: BeautifulSoup, page_url: str, source_name: str, observed_at: datetime, platform: str | None) -> list[EventCandidate]:
+    selector = PLATFORM_CARD_SELECTORS.get(platform or "", "[data-event], [class*='event-card'], article")
+    candidates: list[EventCandidate] = []
+    for card in soup.select(selector):
+        anchor = card.select_one("a[href]")
+        title_node = card.select_one("[data-event-title], [class*='title'], h1, h2, h3, h4") or anchor
+        title = title_node.get_text(" ", strip=True) if title_node else ""
+        if not title or not anchor:
+            continue
+        attrs = card.attrs
+        mapping: dict[str, Any] = {
+            "@type": "Event", "name": title, "url": anchor.get("href"), "description": card.get_text(" ", strip=True)[:2000],
+            "startDate": attrs.get("data-start") or attrs.get("data-start-date") or attrs.get("data-start-time"),
+            "endDate": attrs.get("data-end") or attrs.get("data-end-date"), "registrationDeadline": attrs.get("data-registration-deadline") or attrs.get("data-deadline"),
+            "registrationUrl": attrs.get("data-registration-url") or attrs.get("data-register-url"), "price": attrs.get("data-price"),
+            "registrationStatus": attrs.get("data-registration-state") or attrs.get("data-registration-status"),
+            "registrationOpenedAt": attrs.get("data-registration-opened-at") or attrs.get("data-registration-open-date"),
+            "eligibility": attrs.get("data-eligibility"), "location": {"name": attrs.get("data-venue"), "city": attrs.get("data-city")}, "format": attrs.get("data-format"),
+        }
+        candidate = _candidate_from_mapping(mapping, page_url, source_name, observed_at, f"{platform or 'generic'}:html")
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def _label_value(soup: BeautifulSoup, labels: tuple[str, ...]) -> str | None:
+    """Read documented label/value adjacency without guessing from page prose."""
+
+    normalized_labels = {label.casefold() for label in labels}
+    for text_node in soup.find_all(string=True):
+        label = " ".join(text_node.strip().split()).casefold()
+        if label.rstrip(":") not in normalized_labels:
+            continue
+        parent = text_node.parent
+        sibling = parent.find_next_sibling()
+        if sibling:
+            value = sibling.get_text(" ", strip=True)
+            if value:
+                return value
+        if parent.name in {"dt", "th"}:
+            sibling = parent.find_next_sibling(["dd", "td"])
+            if sibling:
+                value = sibling.get_text(" ", strip=True)
+                if value:
+                    return value
+        container = parent.parent
+        if container:
+            value = container.get_text(" ", strip=True)
+            value = re.sub(rf"^{re.escape(text_node.strip())}\s*:?[\s-]*", "", value, flags=re.I)
+            if value and value != text_node.strip():
+                return value
+    return None
+
+
+def _label_time(value: str | None) -> datetime | None:
+    """Parse an explicitly labelled full date only; never supply a missing year."""
+
+    if not value or not re.search(r"\b20\d{2}\b", value):
+        return None
+    try:
+        parsed = date_parser.parse(value, fuzzy=True)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+    return parsed.astimezone(UTC)
+
+
+def _semantic_candidate(
+    soup: BeautifulSoup,
+    page_url: str,
+    source_name: str,
+    observed_at: datetime,
+    platform: str | None,
+) -> EventCandidate | None:
+    """Platform-detail fallback for public pages whose facts are semantic labels."""
+
+    title_node = soup.select_one("h1")
+    title = title_node.get_text(" ", strip=True) if title_node else ""
+    starts_text = _label_value(
+        soup,
+        ("starts", "runs from", "happening", "date and time", "date & time", "date"),
+    )
+    starts_at = _label_time(starts_text)
+    if starts_at is None:
+        time_node = soup.select_one("time[datetime]")
+        starts_at = _parse_time(time_node.get("datetime") if time_node else None)
+    if not title or not starts_at:
+        return None
+    ends_at = _label_time(_label_value(soup, ("ends", "ends at", "runs until")))
+    venue = _label_value(soup, ("venue", "location", "address"))
+    city = "Bengaluru" if venue and re.search(r"\b(?:bengaluru|bangalore|blr)\b", venue, re.I) else None
+    organizer = _label_value(soup, ("presented by", "hosted by", "host", "organizer"))
+    registration_state_text = _label_value(
+        soup,
+        ("registration", "registration status", "applications", "application status", "status"),
+    )
+    page_text = soup.get_text(" ", strip=True)
+    registration_state = _registration_state(registration_state_text or page_text)
+    deadline = _label_time(
+        _label_value(soup, ("registration deadline", "apply by", "sales end", "applications close"))
+    )
+    eligibility = _label_value(soup, ("eligibility", "who can participate", "who can apply"))
+    price = _label_value(soup, ("fee", "cost", "price", "entry fee"))
+    if not price and re.search(r"\bfree(?: of cost)?\b", page_text, re.I):
+        price = "Free"
+    format_text = _label_value(soup, ("format", "event format", "mode", "how to attend"))
+    registration_anchor = soup.find(
+        "a",
+        href=True,
+        string=re.compile(r"register|registration|rsvp|apply|ticket", re.I),
+    )
+    registration_url = urljoin(page_url, registration_anchor["href"]) if registration_anchor else page_url
+    speakers_value = _label_value(soup, ("speakers", "speaker"))
+    speakers = [speakers_value] if speakers_value else []
+    evidence = SourceEvidence(
+        source_name=source_name,
+        source_url=page_url,
+        observed_at=observed_at,
+        facts={"parser": f"{platform or 'generic'}:semantic_labels"},
+    )
+    return EventCandidate(
+        title=title,
+        canonical_url=page_url,
+        source_url=page_url,
+        source_name=source_name,
+        organizer=organizer,
+        description="",
+        starts_at=starts_at,
+        ends_at=ends_at,
+        venue=venue,
+        city=city,
+        format=_format(format_text, venue, "online" in page_text.casefold()),
+        event_type=_event_type(title, page_text),
+        registration_state=registration_state,
+        registration_url=registration_url,
+        registration_deadline=deadline,
+        registration_opened_at=_label_time(
+            _label_value(
+                soup,
+                ("registration opened", "registration open date", "applications opened"),
+            )
+        ),
+        price_text=price,
+        is_explicitly_paid=_is_paid(price),
+        eligibility_text=eligibility,
+        speakers=speakers,
+        evidence=evidence,
+    )
+
+
+def parse_event_page(html: str, page_url: str, source_name: str, observed_at: datetime | None = None, platform: str | None = None) -> list[EventCandidate]:
+    """Extract JSON-LD, embedded public JSON, and platform card markup without invented facts."""
+    observed_at = observed_at or datetime.now(UTC)
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: list[EventCandidate] = []
+    for script in soup.select("script[type='application/ld+json'], script[type='application/json'], script#__NEXT_DATA__"):
+        try:
+            payload = json.loads(script.get_text(strip=True))
+        except json.JSONDecodeError:
+            continue
+        parser_name = "json_ld" if script.get("type") == "application/ld+json" else "embedded_json"
+        for node in _json_nodes(payload):
+            candidate = _candidate_from_mapping(node, page_url, source_name, observed_at, parser_name)
+            if candidate:
+                candidates.append(candidate)
+    candidates.extend(_html_card_candidates(soup, page_url, source_name, observed_at, platform))
+    if semantic := _semantic_candidate(soup, page_url, source_name, observed_at, platform):
+        candidates.append(semantic)
+    if candidates:
+        return _dedupe_candidates(candidates)
+    title_tag = soup.find("meta", property="og:title") or soup.title
+    title = title_tag.get("content", "").strip() if title_tag and title_tag.name == "meta" else (title_tag.get_text(strip=True) if title_tag else None)
+    if not title:
+        return []
+    description_tag = soup.find("meta", property="og:description")
+    description = description_tag.get("content", "").strip() if description_tag else ""
+    canonical = soup.find("link", rel="canonical")
+    canonical_url = canonical.get("href") if canonical else page_url
+    evidence_text = " ".join(filter(None, [title, description, soup.get_text(" ", strip=True)]))[:3000]
+    evidence = SourceEvidence(source_name=source_name, source_url=page_url, observed_at=observed_at, facts={"parser": "opengraph", "title": title, "description": description})
+    return [EventCandidate(title=title, canonical_url=urljoin(page_url, canonical_url), source_url=page_url, source_name=source_name, description=description, event_type=_event_type(title, description), registration_state=_registration_state(evidence_text), evidence=evidence)]
+
+
+def _dedupe_candidates(candidates: list[EventCandidate]) -> list[EventCandidate]:
+    deduped: dict[str, EventCandidate] = {}
+    for candidate in candidates:
+        existing = deduped.get(candidate.canonical_url)
+        if existing is None or sum(value is not None for value in candidate.model_dump().values()) > sum(value is not None for value in existing.model_dump().values()):
+            deduped[candidate.canonical_url] = candidate
+    return list(deduped.values())

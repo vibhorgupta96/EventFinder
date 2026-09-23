@@ -1,0 +1,44 @@
+server:
+  host: 127.0.0.1
+  port: 8766
+scheduler:
+  discovery_hours: 3
+  digest_hour_ist: 9
+  timezone: Asia/Kolkata
+policy:
+  near_future_days: 60
+  newly_opened_extended_days: 180
+  registration_opened_days: 7
+  dashboard_limit: 100
+ai:
+  provider_order: [gemini, groq]
+  timeout_seconds: 15
+ranking:
+  minimum_score: 3
+  digest_limit: 10
+topics:
+  include:
+    - ai
+    - artificial intelligence
+    - machine learning
+    - llm
+    - engineering
+    - developer
+    - cloud
+    - data
+    - security
+    - devops
+    - kubernetes
+    - python
+    - javascript
+    - systems
+    - hackathon
+    - buildathon
+  exclude:
+    - product management
+    - founder
+    - startup pitch
+    - sales
+    - career fair
+    - networking mixer
+

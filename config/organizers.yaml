@@ -1,0 +1,46 @@
+organizers:
+  - name: Google Developer Groups Bengaluru
+    aliases: [GDG Bengaluru, GDG Bangalore, Google Developer Groups]
+    domains: [gdg.community.dev, developers.google.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [gdg_bengaluru]
+  - name: Microsoft Reactor
+    aliases: [Microsoft Reactor, Microsoft]
+    domains: [developer.microsoft.com, events.microsoft.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [microsoft_reactor]
+  - name: Amazon Web Services
+    aliases: [AWS, AWS User Group]
+    domains: [aws.amazon.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [aws_events]
+  - name: NVIDIA
+    aliases: [NVIDIA Developer]
+    domains: [nvidia.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [nvidia_developer]
+  - name: Cloud Native Computing Foundation
+    aliases: [CNCF, Kubernetes]
+    domains: [cncf.io]
+    trust: high
+    online_allowed: true
+    source_profiles: [cncf_events]
+  - name: Hasgeek
+    aliases: [HasGeek]
+    domains: [hasgeek.com]
+    trust: high
+    online_allowed: true
+  - name: Devfolio
+    aliases: [Devfolio]
+    domains: [devfolio.co]
+    trust: medium
+    online_allowed: false
+  - name: Bengaluru Tech Community
+    aliases: [Bangalore Tech, Bengaluru Developers]
+    domains: []
+    trust: medium
+    online_allowed: false

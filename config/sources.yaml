@@ -1,0 +1,116 @@
+# Public, unauthenticated pages only. The service never bypasses robots, CAPTCHAs, or access controls.
+sources:
+  - name: luma_bengaluru
+    adapter: public_page
+    platform: luma
+    url: https://lu.ma/bangalore
+    allowed_domains: [lu.ma]
+    enabled: true
+    priority: true
+    cadence_hours: 3
+    rate_limit_seconds: 3
+    max_pages: 2
+    pagination_param: page
+  - name: meetup_bengaluru
+    adapter: public_page
+    platform: meetup
+    url: https://www.meetup.com/find/?location=in--Bengaluru
+    allowed_domains: [meetup.com]
+    enabled: true
+    priority: true
+    cadence_hours: 3
+    rate_limit_seconds: 4
+    max_pages: 2
+    pagination_param: page
+  - name: hasgeek
+    adapter: public_page
+    platform: hasgeek
+    url: https://hasgeek.com/events
+    allowed_domains: [hasgeek.com]
+    enabled: true
+    priority: true
+    cadence_hours: 3
+    rate_limit_seconds: 3
+    max_pages: 2
+    pagination_param: page
+  - name: devfolio
+    adapter: public_page
+    platform: devfolio
+    url: https://devfolio.co/hackathons
+    allowed_domains: [devfolio.co]
+    enabled: true
+    priority: true
+    cadence_hours: 3
+    rate_limit_seconds: 4
+  - name: unstop
+    adapter: public_page
+    platform: unstop
+    url: https://unstop.com/hackathons
+    allowed_domains: [unstop.com]
+    enabled: true
+    priority: false
+    cadence_hours: 3
+    rate_limit_seconds: 4
+  - name: eventbrite_search
+    adapter: search
+    platform: eventbrite
+    query: site:eventbrite.com Bengaluru AI engineering meetup hackathon
+    allowed_domains: [eventbrite.com]
+    enabled: true
+    priority: false
+    cadence_hours: 6
+    rate_limit_seconds: 5
+  - name: gdg_bengaluru
+    adapter: public_page
+    platform: official
+    url: https://gdg.community.dev/gdg-bengaluru/
+    allowed_domains: [gdg.community.dev]
+    enabled: true
+    priority: true
+    cadence_hours: 3
+    rate_limit_seconds: 3
+  - name: microsoft_reactor
+    adapter: public_page
+    platform: official
+    url: https://developer.microsoft.com/en-us/reactor/
+    allowed_domains: [developer.microsoft.com, events.microsoft.com]
+    enabled: true
+    priority: true
+    cadence_hours: 6
+    rate_limit_seconds: 3
+  - name: aws_events
+    adapter: public_page
+    platform: official
+    url: https://aws.amazon.com/events/
+    allowed_domains: [aws.amazon.com]
+    enabled: true
+    priority: false
+    cadence_hours: 6
+    rate_limit_seconds: 3
+  - name: nvidia_developer
+    adapter: public_page
+    platform: official
+    url: https://developer.nvidia.com/events
+    allowed_domains: [nvidia.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: github_events
+    adapter: public_page
+    platform: official
+    url: https://github.com/events
+    allowed_domains: [github.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: cncf_events
+    adapter: public_page
+    platform: official
+    url: https://www.cncf.io/events/
+    allowed_domains: [cncf.io]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3

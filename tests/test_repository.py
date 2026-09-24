@@ -136,6 +136,28 @@ async def test_weaker_terminal_cross_posting_cannot_override_trusted_event(
 
 
 @pytest.mark.asyncio
+async def test_unverified_organizer_alias_cannot_gain_merge_authority(
+    session, candidate, config, organizers
+):
+    event, _, _ = upsert_candidate(session, candidate, await assess_candidate(candidate, config, organizers))
+    assert event is not None
+    assert event.organizer_trust == "high"
+
+    spoofed = candidate.model_copy(deep=True)
+    spoofed.source_name = "luma_bengaluru"
+    spoofed.source_url = "https://lu.ma/third-party-event"
+    spoofed.canonical_url = "https://lu.ma/third-party-event"
+    spoofed.description = "Unverified listing overwrite"
+    assessment = await assess_candidate(spoofed, config, organizers)
+    assert assessment.organizer_trust == "low"
+
+    updated, changes, _ = upsert_candidate(session, spoofed, assessment)
+    assert updated is not None
+    assert updated.description == candidate.description
+    assert not changes
+
+
+@pytest.mark.asyncio
 async def test_sparse_cross_posting_does_not_demote_or_erase_known_facts(
     session, candidate, config, organizers
 ):

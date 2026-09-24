@@ -39,13 +39,13 @@ make stop
 - Includes technical/AI/developer talks, workshops, practitioner conferences, hackathons, buildathons, and engineering competitions.
 - Allows events up to 60 days ahead; it allows up to 180 days only when registration opened in the last seven days.
 - Allows Bengaluru/Bangalore in-person or hybrid events, plus online events from organizers marked as trusted and online-enabled in `config/organizers.yaml`.
-- Rejects explicitly paid, student-only, employee-only, private, product/founder/pitch/sales/career/generic-networking events. Unknown price remains eligible and is shown as `Price not stated`.
+- Rejects explicitly paid, student-only, employee-only, private, product/founder/pitch/sales/career/generic-networking events. Mixed wording such as a free expo with a paid pass/workshop is treated as paid; unknown price remains eligible and is shown as `Price not stated`.
 - Candidates with missing dates or ambiguous technical fit go to `Needs review`; an AI outage never turns ambiguity into an accepted event.
 
 ## Configuration and public interfaces
 
 - `config/config.yaml` controls schedule, horizon, score threshold, and AI provider order.
-- `config/sources.yaml` lists public, unauthenticated source adapters and their per-source cadence/rate limit.
+- `config/sources.yaml` lists public, unauthenticated source adapters, their per-source cadence/rate limit, optional bounded listing-to-detail rules, and display-only registration-link domains.
 - `config/organizers.yaml` controls trust and global-online eligibility.
 - `.env` is ignored and is EventFinder-specific; do not copy values from another project.
 
@@ -60,7 +60,11 @@ No write HTTP routes or Telegram commands are exposed.
 
 ## Source behavior
 
-The built-in adapters use public HTML/JSON-LD/OpenGraph metadata for Luma, Meetup public listings, Hasgeek, Devfolio, Unstop, official engineering surfaces, and search-indexed Eventbrite pages. They do not use privileged APIs: Eventbrite's public event-search API is retired, Meetup API access is restricted, and Luma's API has plan requirements. Source failures are recorded individually, so a 403, CAPTCHA, 429, or markup change does not stop other sources. A 429 pauses the source rather than retrying it aggressively.
+The 19 active curated sources cover Bengaluru communities (including GDG, FOSS United, Global AI, CNCF, and Atlassian), established discovery platforms, and official engineering calendars from Google, Databricks, AWS, Microsoft, NVIDIA, CNCF, and GitHub. They use public HTML/JSON-LD/OpenGraph metadata only; no privileged APIs are used. Eventbrite's public event-search API is retired, Meetup API access is restricted, and Luma's API has plan requirements.
+
+Open Source India, Salesforce Developer Events, Docker Events, and Red Hat Summit Connect remain vetted but disabled source definitions: their current public pages do not expose a stable, bounded event-detail contract. They are deliberately excluded from active coverage until that changes, rather than treating arbitrary provider links or page prose as event facts.
+
+Listing-to-detail hydration is opt-in per source, uses only configured selectors/path prefixes, de-duplicates links, and has a small per-source cap. Every listing and detail request goes through the same URL/DNS safety, configured redirect boundary, robots, rate-limit, access-denial, and CAPTCHA checks. Registration links are never fetched; they are shown only when they pass URL safety and the source's separate registration-domain allowlist. A source failure is recorded individually, so a 403, CAPTCHA, 429, or markup change does not stop other sources; a 429 pauses the source rather than retrying it aggressively.
 
 ## Verification
 
@@ -74,6 +78,14 @@ git diff --check
 Tests are offline and fixture-driven. The smoke command uses a temporary SQLite file and never calls a source, starts launchd, or sends Telegram.
 
 The smoke-live Make target is an opt-in, bounded read-only check of at most two
-configured public sources. It uses a separate temporary SQLite database, starts no
-scheduler or Telegram client, and records robots, access, rate-limit, timeout, and
-zero-result outcomes as source observations.
+configured public sources. To target a source (and raise the bound only when needed),
+run:
+
+```sh
+uv run python -m eventfinder.live_smoke --source foss_united_bengaluru
+uv run python -m eventfinder.live_smoke --max-sources 2 --source google_developers --source databricks_events
+```
+
+It uses a separate temporary SQLite database, starts no scheduler or Telegram client,
+and records robots, access, rate-limit, timeout, and zero-result outcomes as source
+observations. A requested name must be enabled and cannot exceed `--max-sources`.

@@ -113,6 +113,7 @@ async def run_live_smoke(
     *,
     max_sources: int = 2,
     timeout: float = 30,
+    source_names: list[str] | None = None,
     config: FileConfig | None = None,
     sources: SourcesRegistry | None = None,
     organizers: OrganizersRegistry | None = None,
@@ -133,7 +134,18 @@ async def run_live_smoke(
     config = config or get_file_config()
     sources = sources or get_sources_registry()
     organizers = organizers or get_organizers_registry()
-    selected = [source for source in sources.sources if source.enabled][:max_sources]
+    enabled_by_name = {source.name: source for source in sources.sources if source.enabled}
+    if source_names:
+        if len(source_names) != len(set(source_names)):
+            raise ValueError("source names must not be repeated")
+        unknown = [name for name in source_names if name not in enabled_by_name]
+        if unknown:
+            raise ValueError("unknown or disabled source: " + ", ".join(unknown))
+        if len(source_names) > max_sources:
+            raise ValueError("selected sources exceed max_sources")
+        selected = [enabled_by_name[name] for name in source_names]
+    else:
+        selected = [source for source in sources.sources if source.enabled][:max_sources]
 
     with tempfile.TemporaryDirectory(prefix="eventfinder-live-smoke-") as directory:
         database_url = f"sqlite:///{Path(directory) / 'live-smoke.sqlite3'}"
@@ -178,13 +190,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-sources", type=_positive_int, default=2)
     parser.add_argument("--timeout", type=_positive_float, default=30)
+    parser.add_argument(
+        "--source",
+        dest="source_names",
+        action="append",
+        metavar="NAME",
+        help="run a named enabled source (repeatable; remains bounded by --max-sources)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        asyncio.run(run_live_smoke(max_sources=args.max_sources, timeout=args.timeout))
+        asyncio.run(
+            run_live_smoke(
+                max_sources=args.max_sources,
+                timeout=args.timeout,
+                source_names=args.source_names,
+            )
+        )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"EventFinder live smoke failed locally: {error}")
         return 1

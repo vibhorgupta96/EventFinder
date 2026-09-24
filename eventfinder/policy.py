@@ -63,31 +63,53 @@ class Assessment:
 def match_organizer(candidate: EventCandidate, registry: OrganizersRegistry) -> OrganizerMatch:
     organizer_text = (candidate.organizer or "").casefold()
     hostname = (urlparse(candidate.canonical_url).hostname or "").casefold()
+    alias_match: OrganizerMatch | None = None
     profile_match: OrganizerMatch | None = None
     for organizer in registry.organizers:
         aliases = [organizer.name, *organizer.aliases]
-        alias_match = any(
+        matches_alias = any(
             re.search(rf"(?<!\w){re.escape(alias.casefold())}(?!\w)", organizer_text)
             for alias in aliases
-        )
-        owned_domain_match = any(
-            hostname == domain.casefold() or hostname.endswith(f".{domain.casefold()}")
-            for domain in organizer.domains
         )
         # A configured source profile provides provenance, but an online event
         # still needs an organizer identity from its own public facts. A generic
         # listing source is not evidence that every event it hosts is trusted.
         matches_profile = candidate.source_name in organizer.source_profiles
-        if alias_match or owned_domain_match:
+        # An explicit organizer label is more specific than a shared vendor
+        # domain (for example, Google developer properties host multiple
+        # official programs).
+        owned_domain_match = any(
+            hostname == domain.casefold() or hostname.endswith(f".{domain.casefold()}")
+            for domain in organizer.domains
+        )
+        if matches_alias and (owned_domain_match or matches_profile):
             return OrganizerMatch(organizer.name, organizer.trust, organizer.online_allowed, True)
+        if matches_alias and alias_match is None:
+            # A name may be useful display provenance, but on a multi-tenant
+            # page it cannot carry the organizer's configured trust or merge
+            # authority until a source profile and alias, or an owned domain,
+            # verifies that identity.
+            alias_match = OrganizerMatch(
+                organizer.name,
+                "low",
+                False,
+                False,
+            )
         if matches_profile and profile_match is None:
             profile_match = OrganizerMatch(
                 organizer.name,
-                organizer.trust,
-                organizer.online_allowed,
+                "low",
+                False,
                 False,
             )
-    return profile_match or OrganizerMatch(None, "low", False, False)
+    for organizer in registry.organizers:
+        owned_domain_match = any(
+            hostname == domain.casefold() or hostname.endswith(f".{domain.casefold()}")
+            for domain in organizer.domains
+        )
+        if owned_domain_match:
+            return OrganizerMatch(organizer.name, organizer.trust, organizer.online_allowed, True)
+    return alias_match or profile_match or OrganizerMatch(None, "low", False, False)
 
 
 def is_bengaluru(candidate: EventCandidate) -> bool:

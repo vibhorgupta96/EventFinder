@@ -40,11 +40,21 @@ async def test_unknown_price_is_eligible_and_approval_is_badged(candidate, confi
 
 
 @pytest.mark.asyncio
+async def test_mixed_free_and_paid_wording_is_rejected(candidate, config, organizers):
+    candidate.is_explicitly_paid = False
+    candidate.price_text = "Free expo entry; paid workshop pass available"
+    assessment = await assess_candidate(candidate, config, organizers)
+    assert assessment.status == "rejected"
+    assert assessment.reason == "Explicitly paid admission"
+
+
+@pytest.mark.asyncio
 async def test_trusted_global_online_is_allowed(candidate, config, organizers):
     candidate.city = "New York"
     candidate.venue = None
     candidate.format = EventFormat.ONLINE
     candidate.organizer = "Microsoft Reactor"
+    candidate.canonical_url = "https://developer.microsoft.com/en-us/reactor/events/example"
     assert (await assess_candidate(candidate, config, organizers)).status == "eligible"
 
 
@@ -57,6 +67,21 @@ async def test_untrusted_global_online_is_rejected(candidate, config, organizers
     assert (await assess_candidate(candidate, config, organizers)).status == "rejected"
 
 
+@pytest.mark.asyncio
+async def test_source_profile_alone_cannot_make_transport_hosted_online_event_trusted(
+    candidate, config, organizers
+):
+    candidate.city = "New York"
+    candidate.venue = None
+    candidate.format = EventFormat.ONLINE
+    candidate.source_name = "cncf_bengaluru"
+    candidate.canonical_url = "https://ocgroups.dev/events/details/example"
+    candidate.organizer = None
+    assert (await assess_candidate(candidate, config, organizers)).status == "rejected"
+    candidate.organizer = "CNCF"
+    assert (await assess_candidate(candidate, config, organizers)).status == "eligible"
+
+
 def test_multi_tenant_listing_domains_do_not_confer_organizer_trust(candidate, organizers):
     candidate.canonical_url = "https://lu.ma/third-party-event"
     candidate.organizer = "Unknown Organizer"
@@ -64,6 +89,30 @@ def test_multi_tenant_listing_domains_do_not_confer_organizer_trust(candidate, o
     assert match_organizer(candidate, organizers).trust == "low"
     candidate.canonical_url = "https://www.meetup.com/unknown/events/1"
     assert match_organizer(candidate, organizers).trust == "low"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("canonical_url", "source_name"),
+    [
+        ("https://lu.ma/third-party-event", "luma_bengaluru"),
+        ("https://www.meetup.com/unknown/events/1", "meetup_bengaluru"),
+    ],
+)
+async def test_alias_on_multi_tenant_event_page_does_not_verify_online_identity(
+    candidate, config, organizers, canonical_url, source_name
+):
+    candidate.city = "New York"
+    candidate.venue = None
+    candidate.format = EventFormat.ONLINE
+    candidate.canonical_url = canonical_url
+    candidate.source_name = source_name
+    candidate.organizer = "CNCF"
+    matched = match_organizer(candidate, organizers)
+    assert matched.name == "Cloud Native Computing Foundation"
+    assert matched.trust == "low"
+    assert matched.explicit_identity is False
+    assert (await assess_candidate(candidate, config, organizers)).status == "rejected"
 
 
 @pytest.mark.asyncio

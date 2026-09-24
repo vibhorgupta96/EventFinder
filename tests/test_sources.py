@@ -6,7 +6,8 @@ from pathlib import Path
 
 import httpx
 import pytest
-from eventfinder.config import SourceDefinition
+from eventfinder.config import SourceDefinition, get_sources_registry
+from eventfinder.domain import has_explicit_paid_price, normalize_price
 from eventfinder.policy import assess_candidate
 from eventfinder.sources import (
     PublicPageEventSource,
@@ -108,6 +109,87 @@ async def test_semantic_price_evidence_marks_paid_events_for_policy(
 
 
 @pytest.mark.asyncio
+async def test_multiple_schema_offers_preserve_paid_tier_evidence_for_policy(config, organizers):
+    html = """<script type='application/ld+json'>{
+      "@type":"Event", "name":"Bengaluru AI Expo",
+      "startDate":"2026-10-10T10:00:00+05:30",
+      "location":{"name":"Bengaluru"},
+      "offers":[
+        {"price":"0", "priceCurrency":"INR"},
+        {"price":"499", "priceCurrency":"INR"}
+      ]
+    }</script>"""
+    candidate = parse_event_page(html, "https://events.example.test/expo", "fixture")[0]
+    assert candidate.price_text == "INR 0; INR 499"
+    assert candidate.is_explicitly_paid is True
+    assert (await assess_candidate(candidate, config, organizers)).status == "rejected"
+
+
+@pytest.mark.parametrize(
+    ("value", "normalized", "is_paid"),
+    [
+        (499, "499", True),
+        (499.5, "499.5", True),
+        (0, "0", False),
+        (float("inf"), None, False),
+        (" 499 INR ", "499 INR", True),
+        ("Free entry; 499 INR workshop", "Free entry; 499 INR workshop", True),
+    ],
+)
+def test_price_normalizer_handles_finite_numbers_postfix_currency_and_mixed_text(
+    value, normalized, is_paid
+):
+    assert normalize_price(value) == normalized
+    assert has_explicit_paid_price(value) is is_paid
+
+
+@pytest.mark.parametrize(
+    ("node", "expected_price", "is_paid"),
+    [
+        ('"price":499', "499", True),
+        (
+            '"offers":[{"price":0,"priceCurrency":"INR"},{"price":499,"priceCurrency":"INR"}]',
+            "INR 0; INR 499",
+            True,
+        ),
+        ('"price":"499 INR"', "499 INR", True),
+    ],
+)
+def test_schema_numeric_and_postfix_prices_are_preserved(node, expected_price, is_paid):
+    html = f"""<script type='application/ld+json'>{{
+      "@type":"Event", "name":"Bengaluru AI Workshop",
+      "startDate":"2026-10-10T10:00:00+05:30", "location":{{"name":"Bengaluru"}},
+      {node}
+    }}</script>"""
+    candidate = parse_event_page(html, "https://events.example.test/price", "fixture")[0]
+    assert candidate.price_text == expected_price
+    assert candidate.is_explicitly_paid is is_paid
+
+
+@pytest.mark.parametrize(
+    ("source_name", "fixture_name", "page_url", "expected_organizer"),
+    [
+        ("foss_united_bengaluru", "foss_united_event.html", "https://platform.fossunited.org/c/bengaluru/april-meetup", "FOSS United"),
+        ("global_ai_bengaluru", "global_ai_event.html", "https://globalai.community/e/bd1o37ln", "Global AI Bengaluru"),
+        ("cncf_bengaluru", "cncf_bengaluru_event.html", "https://ocgroups.dev/cncf/group/52r68y4/event/abcd", "CNCF"),
+        ("atlassian_bangalore", "atlassian_bangalore_event.html", "https://ace.atlassian.com/events/details/atlassian-bangalore-presents-rovo/", "Atlassian Community"),
+        ("google_search_central", "google_rsvp_event.html", "https://rsvp.withgoogle.com/events/search-central-live-bengaluru", "Google Search Central"),
+        ("google_developers", "google_rsvp_event.html", "https://rsvp.withgoogle.com/events/google-developers", "Google Search Central"),
+        ("databricks_events", "databricks_webinar_event.html", "https://www.databricks.com/resources/webinar/databricks-apac-learning-festival", "Databricks"),
+    ],
+)
+def test_enabled_new_source_detail_fixtures_extract_factual_fields(
+    source_name, fixture_name, page_url, expected_organizer
+):
+    source = next(source for source in get_sources_registry().sources if source.name == source_name)
+    html = Path("tests/fixtures", fixture_name).read_text(encoding="utf-8")
+    candidate = parse_event_page(html, page_url, source_name, platform=source.platform)[0]
+    assert candidate.starts_at is not None
+    assert candidate.organizer == expected_organizer
+    assert candidate.registration_url and candidate.registration_url.startswith("https://")
+
+
+@pytest.mark.asyncio
 async def test_public_page_adapter_respects_robots_and_parses():
     fixture = Path("tests/fixtures/event_page.html").read_text(encoding="utf-8")
 
@@ -152,7 +234,15 @@ def test_factory_covers_both_adapter_contracts():
     client = httpx.AsyncClient(transport=transport)
     try:
         assert make_source(SourceDefinition(name="page", adapter="public_page", url="https://x.test"), client).__class__.__name__ == "PublicPageEventSource"
-        assert make_source(SourceDefinition(name="search", adapter="search", query="test"), client).__class__.__name__ == "SearchEventSource"
+        assert make_source(
+            SourceDefinition(
+                name="search",
+                adapter="search",
+                query="test",
+                allowed_domains=["events.example.test"],
+            ),
+            client,
+        ).__class__.__name__ == "SearchEventSource"
     finally:
         asyncio.run(client.aclose())
 
@@ -350,6 +440,273 @@ async def test_per_origin_rate_limit_applies_to_each_paginated_request():
         )
         await source.fetch()
     assert delays == [3]
+
+
+@pytest.mark.asyncio
+async def test_configured_detail_hydration_is_bounded_and_deduplicated():
+    listing = Path("tests/fixtures/detail_listing.html").read_text(encoding="utf-8")
+    detail = Path("tests/fixtures/detail_event.html").read_text(encoding="utf-8")
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        if request.url.path == "/listing":
+            return httpx.Response(200, text=listing)
+        if request.url.path in {"/events/a", "/events/b"}:
+            return httpx.Response(200, text=detail)
+        raise AssertionError(f"unexpected detail request: {request.url.path}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(
+                name="details_fixture",
+                adapter="public_page",
+                url="https://events.example.test/listing",
+                allowed_domains=["events.example.test"],
+                detail_link_selectors=["a.event-detail"],
+                detail_link_prefixes=["/events/"],
+                max_detail_pages=2,
+                rate_limit_seconds=0,
+            ),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+        )
+        result = await source.fetch()
+    assert requested == ["/robots.txt", "/listing", "/events/a", "/events/b"]
+    assert [candidate.canonical_url for candidate in result.candidates] == [
+        "https://events.example.test/events/shared"
+    ]
+    assert [item.facts["page_kind"] for item in result.source_evidence] == [
+        "listing",
+        "detail",
+        "detail",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_detail_hydration_merges_complementary_facts_conservatively():
+    listing = """<script type='application/ld+json'>{
+      "@type":"Event", "name":"Bengaluru AI Systems Meetup",
+      "url":"/events/shared", "startDate":"2026-10-10T10:00:00+05:30",
+      "location":{"name":"Bengaluru"}, "description":"Listing facts",
+      "registrationDeadline":"2026-10-05T10:00:00+05:30", "price":"Free"
+    }</script><a class='event-detail' href='/events/shared'>Details</a>"""
+    detail = """<script type='application/ld+json'>{
+      "@type":"Event", "name":"Bengaluru AI Systems Meetup",
+      "url":"/events/shared", "endDate":"2026-10-10T18:00:00+05:30",
+      "description":"Detail facts", "registrationStatus":"Closed",
+      "offers":{"price":"499 INR"}
+    }</script>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        if request.url.path == "/listing":
+            return httpx.Response(200, text=listing)
+        if request.url.path == "/events/shared":
+            return httpx.Response(200, text=detail)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(
+                name="merged_details",
+                adapter="public_page",
+                url="https://events.example.test/listing",
+                allowed_domains=["events.example.test"],
+                detail_link_selectors=["a.event-detail"],
+                detail_link_prefixes=["/events/"],
+                max_detail_pages=1,
+                rate_limit_seconds=0,
+            ),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+        )
+        result = await source.fetch()
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.starts_at is not None
+    assert candidate.ends_at is not None
+    assert candidate.registration_deadline == datetime(2026, 10, 5, 4, 30, tzinfo=UTC)
+    assert candidate.registration_state.value == "closed"
+    assert candidate.price_text == "Free; 499 INR"
+    assert candidate.is_explicitly_paid is True
+    assert candidate.description == "Listing facts; Detail facts"
+    assert candidate.evidence.facts["merged_source_urls"] == [
+        "https://events.example.test/listing",
+        "https://events.example.test/events/shared",
+    ]
+    observations = candidate.evidence.facts["merged_observations"]
+    assert [observation["source_url"] for observation in observations] == [
+        "https://events.example.test/listing",
+        "https://events.example.test/events/shared",
+    ]
+    assert observations[0]["facts"]["event"]["description"] == "Listing facts"
+    assert observations[0]["facts"]["event"]["registrationDeadline"] == "2026-10-05T10:00:00+05:30"
+    assert observations[1]["facts"]["event"]["description"] == "Detail facts"
+    assert all("merged_observations" not in observation["facts"] for observation in observations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail_outcome", ["robots", "redirect", "interstitial"])
+async def test_detail_hydration_keeps_robots_redirect_and_interstitial_boundaries(
+    detail_outcome,
+):
+    listing = '<a class="event-detail" href="/events/blocked">Blocked detail</a>'
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/robots.txt":
+            robots = "User-agent: *\nDisallow: /events/blocked" if detail_outcome == "robots" else "User-agent: *\nAllow: /"
+            return httpx.Response(200, text=robots)
+        if request.url.path == "/listing":
+            return httpx.Response(200, text=listing)
+        if detail_outcome == "redirect":
+            return httpx.Response(302, headers={"location": "https://outside.example.test/event"})
+        if detail_outcome == "interstitial":
+            return httpx.Response(200, text="Checking your browser before accessing")
+        raise AssertionError("robots should reject the detail before requesting it")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(
+                name="details_boundary",
+                adapter="public_page",
+                url="https://events.example.test/listing",
+                allowed_domains=["events.example.test"],
+                detail_link_selectors=["a.event-detail"],
+                detail_link_prefixes=["/events/"],
+                max_detail_pages=1,
+                rate_limit_seconds=0,
+            ),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+        )
+        result = await source.fetch()
+    assert not result.candidates
+    assert result.source_evidence[-1].facts["page_kind"] == "detail"
+    assert "rejected" in result.source_evidence[-1].facts
+    if detail_outcome == "robots":
+        assert requested == ["/robots.txt", "/listing"]
+    else:
+        assert requested == ["/robots.txt", "/listing", "/events/blocked"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("registration_url", "registration_domains", "expected_registration_url"),
+    [
+        ("https://tickets.example.test/event", [], None),
+        (
+            "https://rsvp.withgoogle.com/events/search-central",
+            ["rsvp.withgoogle.com"],
+            "https://rsvp.withgoogle.com/events/search-central",
+        ),
+        (
+            "https://register.opensourceindia.in/2026",
+            ["opensourceindia.in"],
+            "https://register.opensourceindia.in/2026",
+        ),
+    ],
+)
+async def test_registration_urls_need_a_separate_allowlist(
+    registration_url, registration_domains, expected_registration_url
+):
+    html = f"""<script type='application/ld+json'>{{
+      "@type":"Event", "name":"Bengaluru AI Meetup",
+      "url":"https://events.example.test/event",
+      "startDate":"2026-10-10T10:00:00+05:30",
+      "location":{{"name":"Bengaluru"}},
+      "registrationUrl":"{registration_url}"
+    }}</script>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        raise AssertionError(f"registration URLs are not fetched: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(
+                name="registration_fixture",
+                adapter="public_page",
+                url="https://events.example.test/listing",
+                allowed_domains=["events.example.test"],
+                allowed_registration_domains=registration_domains,
+            ),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+        )
+        candidates = await source.validated_candidates(
+            parse_event_page(html, "https://events.example.test/listing", "registration_fixture")
+        )
+    assert len(candidates) == 1
+    assert candidates[0].registration_url == expected_registration_url
+
+
+@pytest.mark.asyncio
+async def test_disallowed_registration_host_is_rejected_before_dns_resolution():
+    resolved_hosts: list[str] = []
+
+    async def resolver(hostname: str) -> list[str]:
+        resolved_hosts.append(hostname)
+        return ["93.184.216.34"]
+
+    html = """<script type='application/ld+json'>{
+      "@type":"Event", "name":"Bengaluru AI Meetup",
+      "url":"https://events.example.test/event",
+      "startDate":"2026-10-10T10:00:00+05:30",
+      "location":{"name":"Bengaluru"},
+      "registrationUrl":"https://tickets.example.test/event"
+    }</script>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        raise AssertionError(f"registration URL was fetched: {request.url}")
+
+    safety = URLSafety(resolver)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(
+                name="registration_dns_boundary",
+                adapter="public_page",
+                url="https://events.example.test/listing",
+                allowed_domains=["events.example.test"],
+            ),
+            client,
+            RobotsPolicy(client, safety),
+            safety,
+        )
+        candidates = await source.validated_candidates(
+            parse_event_page(html, "https://events.example.test/listing", "registration_dns_boundary")
+        )
+    assert candidates[0].registration_url is None
+    assert "tickets.example.test" not in resolved_hosts
+
+
+def test_redirect_transport_domain_is_not_an_implicit_registration_allowlist():
+    definition = next(
+        source for source in get_sources_registry().sources if source.name == "cncf_bengaluru"
+    )
+    source = PublicPageEventSource(
+        definition,
+        httpx.AsyncClient(),
+        safety=_safety(),
+    )
+    try:
+        assert "ocgroups.dev" in source.allowed_domains
+        assert "ocgroups.dev" not in source.allowed_registration_domains
+        assert source.allowed_registration_domains == {"community.cncf.io"}
+    finally:
+        asyncio.run(source.client.aclose())
 
 
 @pytest.mark.asyncio

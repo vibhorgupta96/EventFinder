@@ -28,8 +28,9 @@ from eventfinder.domain import (
     RegistrationState,
     SourceEvidence,
     has_explicit_paid_price,
+    normalize_price,
 )
-from eventfinder.urls import UnsafeURL, URLSafety
+from eventfinder.urls import UnsafeURL, URLSafety, validate_url_syntax
 
 USER_AGENT = "EventFinder/0.1 (+local read-only technical event discovery)"
 ROBOTS_TTL = timedelta(hours=6)
@@ -98,6 +99,18 @@ class EventSource(ABC):
         self.allowed_domains = {domain.casefold() for domain in definition.allowed_domains}
         if definition.url and (hostname := urlsplit(definition.url).hostname):
             self.allowed_domains.add(hostname.casefold())
+        # The fetch boundary can include a redirect transport host. Do not let
+        # that broaden displayable registrations: public-page defaults are the
+        # configured source origin, while search sources have no source URL and
+        # therefore use their required, explicitly configured result boundary.
+        source_owned_domains = (
+            {urlsplit(definition.url).hostname.casefold()}
+            if definition.url and urlsplit(definition.url).hostname
+            else {domain.casefold() for domain in definition.allowed_domains}
+        )
+        self.allowed_registration_domains = source_owned_domains | {
+            domain.casefold() for domain in definition.allowed_registration_domains
+        }
 
     @abstractmethod
     async def fetch(self) -> FetchResult:
@@ -120,10 +133,19 @@ class EventSource(ABC):
                     continue
                 if candidate.registration_url:
                     try:
-                        candidate.registration_url = await self.safety.validate(candidate.registration_url)
+                        normalized_registration_url = validate_url_syntax(candidate.registration_url)
+                        if not _allowed_destination(
+                            normalized_registration_url, self.allowed_registration_domains
+                        ):
+                            candidate.registration_url = None
+                        else:
+                            candidate.registration_url = await self.safety.validate(
+                                normalized_registration_url
+                            )
                     except UnsafeURL:
                         # Keep the factual event, but never expose a destination that
-                        # failed the same outbound-link safety boundary.
+                        # failed the public URL safety boundary. Registration may be
+                        # a configured third-party provider, but not an arbitrary link.
                         candidate.registration_url = None
             except UnsafeURL:
                 continue
@@ -243,12 +265,71 @@ def _listing_urls(definition: SourceDefinition) -> list[str]:
     return urls
 
 
+def _matches_detail_prefix(url: str, prefix: str) -> bool:
+    parsed = urlsplit(url)
+    if prefix.startswith("/"):
+        return parsed.path.startswith(prefix)
+    return url.startswith(prefix)
+
+
+def _configured_detail_urls(
+    html: str, listing_url: str, definition: SourceDefinition
+) -> list[str]:
+    """Return only explicitly configured, deduplicated detail links.
+
+    Link selection is intentionally declarative and never follows inferred
+    pagination or every anchor on a listing. When both selectors and prefixes
+    are configured, a link has to satisfy both rules.
+    """
+
+    if not definition.max_detail_pages:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    selected_hrefs: set[str] = set()
+    if definition.detail_link_selectors:
+        try:
+            selected_nodes = [
+                node
+                for selector in definition.detail_link_selectors
+                for node in soup.select(selector)
+            ]
+        except (ValueError, SyntaxError) as error:
+            raise SourceFetchError(f"invalid configured detail selector: {error}") from error
+        for node in selected_nodes:
+            anchor = node if node.name == "a" and node.get("href") else node.select_one("a[href]")
+            if anchor and (href := anchor.get("href")):
+                selected_hrefs.add(href)
+
+    detail_urls: list[str] = []
+    seen: set[str] = set()
+    for anchor in soup.select("a[href]"):
+        href = anchor.get("href")
+        if not href:
+            continue
+        if definition.detail_link_selectors and href not in selected_hrefs:
+            continue
+        resolved = urlsplit(urljoin(listing_url, href))
+        destination = urlunsplit(
+            (resolved.scheme, resolved.netloc, resolved.path, resolved.query, "")
+        )
+        if definition.detail_link_prefixes and not any(
+            _matches_detail_prefix(destination, prefix)
+            for prefix in definition.detail_link_prefixes
+        ):
+            continue
+        if destination not in seen:
+            detail_urls.append(destination)
+            seen.add(destination)
+    return detail_urls[: definition.max_detail_pages]
+
+
 class PublicPageEventSource(EventSource):
     async def fetch(self) -> FetchResult:
         observed_at = datetime.now(UTC)
         candidates: list[EventCandidate] = []
         evidence: list[SourceEvidence] = []
-        seen: set[str] = set()
+        detail_urls: list[str] = []
+        seen_detail_urls: set[str] = set()
         for listing_url in _listing_urls(self.definition):
             response = await _request_redirect_checked(
                 self.client,
@@ -268,10 +349,13 @@ class PublicPageEventSource(EventSource):
                 observed_at,
                 self.definition.platform,
             )
-            for candidate in await self.validated_candidates(parsed):
-                if candidate.canonical_url not in seen:
-                    candidates.append(candidate)
-                    seen.add(candidate.canonical_url)
+            candidates.extend(await self.validated_candidates(parsed))
+            for detail_url in _configured_detail_urls(
+                response.text, str(response.url), self.definition
+            ):
+                if detail_url not in seen_detail_urls:
+                    detail_urls.append(detail_url)
+                    seen_detail_urls.add(detail_url)
             evidence.append(
                 SourceEvidence(
                     source_name=self.definition.name,
@@ -279,11 +363,71 @@ class PublicPageEventSource(EventSource):
                     observed_at=observed_at,
                     facts={
                         "parser": f"{self.definition.platform or 'generic'}:json+html",
+                        "page_kind": "listing",
                         "candidate_count": len(parsed),
                     },
                 )
             )
-        return FetchResult(candidates=candidates, source_evidence=evidence)
+        for detail_url in detail_urls[: self.definition.max_detail_pages]:
+            try:
+                response = await _request_redirect_checked(
+                    self.client,
+                    detail_url,
+                    self.safety,
+                    self.robots_policy,
+                    self.allowed_domains,
+                    self.limiter,
+                    self.definition.rate_limit_seconds,
+                )
+            except (httpx.HTTPError, SourceFetchError, UnsafeURL) as error:
+                evidence.append(
+                    SourceEvidence(
+                        source_name=self.definition.name,
+                        source_url=detail_url,
+                        observed_at=observed_at,
+                        facts={
+                            "parser": f"{self.definition.platform or 'generic'}:json+html",
+                            "page_kind": "detail",
+                            "rejected": str(error),
+                        },
+                    )
+                )
+                continue
+            if _is_interstitial(response.text):
+                evidence.append(
+                    SourceEvidence(
+                        source_name=self.definition.name,
+                        source_url=str(response.url),
+                        observed_at=observed_at,
+                        facts={
+                            "parser": f"{self.definition.platform or 'generic'}:json+html",
+                            "page_kind": "detail",
+                            "rejected": "captcha or interstitial",
+                        },
+                    )
+                )
+                continue
+            parsed = parse_event_page(
+                response.text,
+                str(response.url),
+                self.definition.name,
+                observed_at,
+                self.definition.platform,
+            )
+            candidates.extend(await self.validated_candidates(parsed))
+            evidence.append(
+                SourceEvidence(
+                    source_name=self.definition.name,
+                    source_url=str(response.url),
+                    observed_at=observed_at,
+                    facts={
+                        "parser": f"{self.definition.platform or 'generic'}:json+html",
+                        "page_kind": "detail",
+                        "candidate_count": len(parsed),
+                    },
+                )
+            )
+        return FetchResult(candidates=_dedupe_candidates(candidates), source_evidence=evidence)
 
 
 class SearchEventSource(EventSource):
@@ -414,6 +558,13 @@ def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value] if value is not None else []
 
 
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
 def _text(value: Any) -> str | None:
     if isinstance(value, str):
         return " ".join(value.split()) or None
@@ -494,17 +645,27 @@ def _registration_state(text: str) -> RegistrationState:
 
 
 def _offer_values(offers: Any) -> tuple[str | None, str | None, str | None, datetime | None]:
+    prices: list[str] = []
+    registration_url: str | None = None
+    availability: str | None = None
+    valid_from: datetime | None = None
     for offer in _as_list(offers):
-        if isinstance(offer, str):
-            return offer, None, None, None
-        if isinstance(offer, dict):
-            price = _text(offer.get("price") or offer.get("amount") or offer.get("fee"))
-            currency = _text(offer.get("priceCurrency") or offer.get("currency"))
-            url = _text(offer.get("url") or offer.get("checkoutUrl"))
-            availability = _text(offer.get("availability"))
-            valid_from = _parse_time(offer.get("validFrom"))
-            return (f"{currency or ''} {price}".strip() if price else None), url, availability, valid_from
-    return None, None, None, None
+        if isinstance(offer, (str, int, float)) and not isinstance(offer, bool):
+            if price := normalize_price(offer):
+                prices.append(price)
+            continue
+        if not isinstance(offer, dict):
+            continue
+        price = normalize_price(_first_present(offer, "price", "amount", "fee"))
+        currency = _text(offer.get("priceCurrency") or offer.get("currency"))
+        if price:
+            prices.append(f"{currency or ''} {price}".strip())
+        registration_url = registration_url or _text(offer.get("url") or offer.get("checkoutUrl"))
+        availability = availability or _text(offer.get("availability"))
+        valid_from = valid_from or _parse_time(offer.get("validFrom"))
+    # A multi-tier offer may include free admission and a paid pass/workshop.
+    # Retain every explicitly displayed price so policy can reject any paid tier.
+    return "; ".join(dict.fromkeys(prices)) or None, registration_url, availability, valid_from
 
 
 def _schema_registration_state(event_status: Any, availability: str | None) -> RegistrationState:
@@ -568,7 +729,7 @@ def _candidate_from_mapping(node: dict[str, Any], page_url: str, source_name: st
     price, offer_url, offer_availability, offer_valid_from = _offer_values(
         node.get("offers") or node.get("ticket") or node.get("pricing") or node.get("tickets")
     )
-    price = price or _text(node.get("price") or node.get("fee") or node.get("price_text"))
+    price = price or normalize_price(_first_present(node, "price", "fee", "price_text"))
     registration_url = _text(node.get("registrationUrl") or node.get("registration_url") or node.get("registrationLink") or node.get("registerUrl") or node.get("applyUrl") or node.get("actionUrl")) or offer_url or event_url
     eligibility = _text(node.get("eligibility") or node.get("eligibility_text") or node.get("eligibilityText") or node.get("audience") or node.get("requirements"))
     speakers = [name for item in _as_list(node.get("performer") or node.get("speakers") or node.get("speaker") or node.get("presenters")) if (name := _text(item))]
@@ -683,7 +844,7 @@ def _semantic_candidate(
 ) -> EventCandidate | None:
     """Platform-detail fallback for public pages whose facts are semantic labels."""
 
-    title_node = soup.select_one("h1")
+    title_node = soup.select_one("h1, main h2")
     title = title_node.get_text(" ", strip=True) if title_node else ""
     starts_text = _label_value(
         soup,
@@ -696,7 +857,7 @@ def _semantic_candidate(
     if not title or not starts_at:
         return None
     ends_at = _label_time(_label_value(soup, ("ends", "ends at", "runs until")))
-    venue = _label_value(soup, ("venue", "location", "address"))
+    venue = _label_value(soup, ("venue", "location", "address", "where"))
     city = "Bengaluru" if venue and re.search(r"\b(?:bengaluru|bangalore|blr)\b", venue, re.I) else None
     organizer = _label_value(soup, ("presented by", "hosted by", "host", "organizer"))
     registration_state_text = _label_value(
@@ -790,10 +951,121 @@ def parse_event_page(html: str, page_url: str, source_name: str, observed_at: da
     return [EventCandidate(title=title, canonical_url=urljoin(page_url, canonical_url), source_url=page_url, source_name=source_name, description=description, event_type=_event_type(title, description), registration_state=_registration_state(evidence_text), evidence=evidence)]
 
 
+_REGISTRATION_STATE_SEVERITY = {
+    RegistrationState.UNKNOWN: 0,
+    RegistrationState.OPEN: 1,
+    RegistrationState.WAITLIST: 2,
+    RegistrationState.CLOSED: 3,
+    RegistrationState.SOLD_OUT: 4,
+    RegistrationState.POSTPONED: 5,
+    RegistrationState.CANCELLED: 6,
+}
+
+
+def _combined_text(first: str | None, second: str | None) -> str | None:
+    values = [value for value in (first, second) if value]
+    return "; ".join(dict.fromkeys(values)) or None
+
+
+def _earliest(first: datetime | None, second: datetime | None) -> datetime | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return min(first, second)
+
+
+def _merged_evidence(first: SourceEvidence, second: SourceEvidence) -> SourceEvidence:
+    """Keep detail provenance primary and retain every flattened observation."""
+
+    evidence = second.model_copy(deep=True)
+    observations = [
+        *_flattened_observations(first),
+        *_flattened_observations(second),
+    ]
+    evidence.facts["merged_observations"] = observations
+    first_urls = first.facts.get("merged_source_urls", [first.source_url])
+    second_urls = second.facts.get("merged_source_urls", [second.source_url])
+    urls = list(dict.fromkeys([*first_urls, *second_urls]))
+    if len(urls) > 1:
+        evidence.facts["merged_source_urls"] = urls
+    return evidence
+
+
+def _flattened_observations(evidence: SourceEvidence) -> list[dict[str, Any]]:
+    """Return auditable evidence payloads without nesting prior merge payloads."""
+
+    merged = evidence.facts.get("merged_observations")
+    if isinstance(merged, list):
+        return [item.copy() for item in merged if isinstance(item, dict)]
+    facts = {
+        key: value
+        for key, value in evidence.facts.items()
+        if key not in {"merged_observations", "merged_source_urls"}
+    }
+    return [
+        {
+            "source_url": evidence.source_url,
+            "raw_id": evidence.raw_id,
+            "observed_at": evidence.observed_at.isoformat(),
+            "facts": facts,
+        }
+    ]
+
+
+def _merge_candidates(existing: EventCandidate, candidate: EventCandidate) -> EventCandidate:
+    """Merge complementary observations without weakening policy-relevant facts."""
+
+    merged = candidate.model_copy(deep=True)
+    merged.title = candidate.title or existing.title
+    merged.source_url = candidate.source_url or existing.source_url
+    merged.organizer = candidate.organizer or existing.organizer
+    merged.description = _combined_text(existing.description, candidate.description)
+    merged.starts_at = candidate.starts_at or existing.starts_at
+    merged.ends_at = candidate.ends_at or existing.ends_at
+    merged.venue = candidate.venue or existing.venue
+    merged.city = candidate.city or existing.city
+    merged.country = candidate.country or existing.country
+    merged.format = (
+        candidate.format if candidate.format != EventFormat.UNKNOWN else existing.format
+    )
+    merged.event_type = (
+        candidate.event_type if candidate.event_type != EventType.UNKNOWN else existing.event_type
+    )
+    merged.registration_state = max(
+        (existing.registration_state, candidate.registration_state),
+        key=lambda state: _REGISTRATION_STATE_SEVERITY[state],
+    )
+    merged.registration_url = candidate.registration_url or existing.registration_url
+    # An earlier deadline/opening must not be silently replaced with a more
+    # permissive observation. Detail end/start values still supply missing facts.
+    merged.registration_deadline = _earliest(
+        existing.registration_deadline, candidate.registration_deadline
+    )
+    merged.registration_opened_at = _earliest(
+        existing.registration_opened_at, candidate.registration_opened_at
+    )
+    merged.first_observed_open_at = _earliest(
+        existing.first_observed_open_at, candidate.first_observed_open_at
+    )
+    merged.price_text = _combined_text(existing.price_text, candidate.price_text)
+    merged.is_explicitly_paid = (
+        existing.is_explicitly_paid
+        or candidate.is_explicitly_paid
+        or has_explicit_paid_price(merged.price_text)
+    )
+    merged.eligibility_text = _combined_text(existing.eligibility_text, candidate.eligibility_text)
+    merged.speakers = list(dict.fromkeys([*existing.speakers, *candidate.speakers]))
+    merged.topics = list(dict.fromkeys([*existing.topics, *candidate.topics]))
+    merged.evidence = _merged_evidence(existing.evidence, candidate.evidence)
+    return merged
+
+
 def _dedupe_candidates(candidates: list[EventCandidate]) -> list[EventCandidate]:
     deduped: dict[str, EventCandidate] = {}
     for candidate in candidates:
         existing = deduped.get(candidate.canonical_url)
-        if existing is None or sum(value is not None for value in candidate.model_dump().values()) > sum(value is not None for value in existing.model_dump().values()):
-            deduped[candidate.canonical_url] = candidate
+        deduped[candidate.canonical_url] = (
+            candidate if existing is None else _merge_candidates(existing, candidate)
+        )
     return list(deduped.values())

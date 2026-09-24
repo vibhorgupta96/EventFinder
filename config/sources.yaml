@@ -74,6 +74,7 @@ sources:
     platform: official
     url: https://developer.microsoft.com/en-us/reactor/
     allowed_domains: [developer.microsoft.com, events.microsoft.com]
+    allowed_registration_domains: [developer.microsoft.com, events.microsoft.com]
     enabled: true
     priority: true
     cadence_hours: 6
@@ -110,6 +111,146 @@ sources:
     platform: official
     url: https://www.cncf.io/events/
     allowed_domains: [cncf.io]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  # Recurring Bengaluru communities. Detail links are explicit and capped; no
+  # source uses inferred pagination.
+  - name: foss_united_bengaluru
+    adapter: public_page
+    platform: official
+    url: https://platform.fossunited.org/c/bengaluru
+    allowed_domains: [fossunited.org, platform.fossunited.org]
+    detail_link_selectors: ["a[href]"]
+    detail_link_prefixes: [/c/bengaluru/]
+    max_detail_pages: 4
+    enabled: true
+    priority: true
+    cadence_hours: 6
+    rate_limit_seconds: 3
+  - name: global_ai_bengaluru
+    adapter: public_page
+    platform: official
+    url: https://globalai.community/chapters/bengaluru/
+    allowed_domains: [globalai.community]
+    detail_link_selectors: ["a[href*='/e/']"]
+    detail_link_prefixes: [https://globalai.community/e/]
+    max_detail_pages: 4
+    enabled: true
+    priority: true
+    cadence_hours: 6
+    rate_limit_seconds: 3
+  - name: cncf_bengaluru
+    adapter: public_page
+    platform: official
+    url: https://community.cncf.io/cloud-native-bangalore/
+    # community.cncf.io currently redirects to its public ocgroups.dev
+    # transport. It remains a fetch boundary, never an organizer identity.
+    allowed_domains: [community.cncf.io, ocgroups.dev]
+    detail_link_selectors: ["a[href*='/cncf/group/52r68y4/event/']"]
+    detail_link_prefixes: [/cncf/group/52r68y4/event/]
+    max_detail_pages: 4
+    enabled: true
+    priority: true
+    cadence_hours: 6
+    rate_limit_seconds: 3
+  - name: atlassian_bangalore
+    adapter: public_page
+    platform: official
+    url: https://ace.atlassian.com/bangalore/
+    allowed_domains: [ace.atlassian.com]
+    detail_link_selectors: ["a[href*='/events/details/']"]
+    detail_link_prefixes: [/events/details/]
+    max_detail_pages: 4
+    enabled: true
+    priority: true
+    cadence_hours: 6
+    rate_limit_seconds: 3
+  # Annual, vendor, and global calendars are useful breadth sources but do
+  # not drive priority-source health or aggressive polling.
+  - name: open_source_india
+    adapter: public_page
+    platform: official
+    url: https://www.opensourceindia.in/
+    allowed_domains: [opensourceindia.in]
+    # The official registration subdomain is a narrow, display-only exception.
+    allowed_registration_domains: [opensourceindia.in]
+    # The annual landing page exposes no stable event-detail contract that the
+    # public adapter can extract without guessing. Keep the vetted source
+    # definition deferred until that contract is available.
+    enabled: false
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: google_search_central
+    adapter: public_page
+    platform: official
+    url: https://developers.google.com/search/events
+    allowed_domains: [developers.google.com, rsvp.withgoogle.com]
+    detail_link_selectors: ["a[href*='rsvp.withgoogle.com/']"]
+    detail_link_prefixes: [https://rsvp.withgoogle.com/]
+    max_detail_pages: 4
+    # Google Search Central uses this official RSVP provider for its hosted
+    # event details and displayed registration links.
+    allowed_registration_domains: [developers.google.com, rsvp.withgoogle.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: google_developers
+    adapter: public_page
+    platform: official
+    url: https://developers.google.com/events
+    allowed_domains: [developers.google.com, rsvp.withgoogle.com]
+    detail_link_selectors: ["a[href*='rsvp.withgoogle.com/']"]
+    detail_link_prefixes: [https://rsvp.withgoogle.com/]
+    max_detail_pages: 4
+    allowed_registration_domains: [developers.google.com, rsvp.withgoogle.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: salesforce_developer_events
+    adapter: public_page
+    platform: official
+    url: https://developer.salesforce.com/events
+    allowed_domains: [developer.salesforce.com]
+    # Event cards link to several external providers, but no stable canonical
+    # detail contract is verified yet.
+    enabled: false
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: docker_events
+    adapter: public_page
+    platform: official
+    url: https://www.docker.com/events/
+    allowed_domains: [docker.com]
+    # Current cards use provider-specific registration links; defer instead of
+    # treating arbitrary outbound links as Docker event pages.
+    enabled: false
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: red_hat_events
+    adapter: public_page
+    platform: official
+    url: https://www.redhat.com/en/summit/connect
+    allowed_domains: [redhat.com]
+    # Summit Connect currently has no published city event cards to hydrate.
+    enabled: false
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: databricks_events
+    adapter: public_page
+    platform: official
+    url: https://www.databricks.com/events
+    allowed_domains: [databricks.com]
+    detail_link_selectors: ["a[href*='/resources/webinar/']"]
+    detail_link_prefixes: [/resources/webinar/]
+    max_detail_pages: 4
     enabled: true
     priority: false
     cadence_hours: 12

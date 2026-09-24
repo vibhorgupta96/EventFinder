@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 from eventfinder.config import SourceDefinition, SourcesRegistry
-from eventfinder.domain import FetchResult
+from eventfinder.domain import FetchResult, SourceEvidence
 from eventfinder.models import Event, SourceRun
 from eventfinder.service import DiscoveryService
 from eventfinder.urls import URLSafety
@@ -153,6 +154,109 @@ async def test_unexpected_source_error_is_recorded_and_later_sources_continue(
     assert runs["broken"].finished_at is not None
     assert runs["broken"].error == "parser exploded"
     assert runs["good"].finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_nonpriority_detail_rejection_is_recorded_and_later_sources_continue(
+    session, candidate, config, organizers, monkeypatch
+):
+    class DetailRejectedSource:
+        async def fetch(self):
+            return FetchResult(
+                source_evidence=[
+                    SourceEvidence(
+                        source_name="detail_rejected",
+                        source_url="https://events.example.test/events/blocked",
+                        observed_at=datetime.now(UTC),
+                        facts={
+                            "page_kind": "detail",
+                            "rejected": "robots policy disallows this URL",
+                        },
+                    )
+                ]
+            )
+
+    class GoodSource:
+        async def fetch(self):
+            return FetchResult(candidates=[candidate])
+
+    engine = session.get_bind()
+    service = DiscoveryService(
+        lambda: Session(engine),
+        config,
+        SourcesRegistry(
+            sources=[
+                SourceDefinition(
+                    name="detail_rejected",
+                    adapter="public_page",
+                    url="https://events.example.test/listing",
+                ),
+                SourceDefinition(
+                    name="good_after_detail_rejection",
+                    adapter="public_page",
+                    url="https://events.example.test/good",
+                ),
+            ]
+        ),
+        organizers,
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200))),
+        safety=URLSafety(_public_resolver),
+    )
+    monkeypatch.setattr(
+        "eventfinder.service.make_source",
+        lambda definition, *_args, **_kwargs: DetailRejectedSource()
+        if definition.name == "detail_rejected"
+        else GoodSource(),
+    )
+
+    totals = await service.run_discovery(force=True)
+    with Session(engine) as verification:
+        runs = {
+            run.source_name: run
+            for run in verification.exec(select(SourceRun)).all()
+        }
+    await service.client.aclose()
+
+    assert totals["accepted"] == 1
+    assert totals["errors"] == 1
+    assert runs["detail_rejected"].error == (
+        "detail hydration rejected 1 page: 1 robots policy disallows this URL"
+    )
+    assert runs["good_after_detail_rejection"].error is None
+
+
+@pytest.mark.asyncio
+async def test_empty_nonpriority_calendar_without_detail_rejection_remains_successful(
+    session, config, organizers, monkeypatch
+):
+    class EmptySource:
+        async def fetch(self):
+            return FetchResult()
+
+    engine = session.get_bind()
+    service = DiscoveryService(
+        lambda: Session(engine),
+        config,
+        SourcesRegistry(sources=[]),
+        organizers,
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200))),
+        safety=URLSafety(_public_resolver),
+    )
+    monkeypatch.setattr("eventfinder.service.make_source", lambda *_args, **_kwargs: EmptySource())
+
+    result = await service._run_source(
+        SourceDefinition(
+            name="empty_calendar",
+            adapter="public_page",
+            url="https://events.example.test/empty",
+        )
+    )
+    with Session(engine) as verification:
+        run = verification.exec(select(SourceRun)).one()
+    await service.client.aclose()
+
+    assert result == {"fetched": 0, "accepted": 0, "review": 0, "rejected": 0, "errors": 0}
+    assert run.error is None
 
 
 @pytest.mark.asyncio

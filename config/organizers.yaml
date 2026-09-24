@@ -1,7 +1,7 @@
 organizers:
   - name: Google Developer Groups Bengaluru
     aliases: [GDG Bengaluru, GDG Bangalore, Google Developer Groups]
-    domains: [gdg.community.dev, developers.google.com]
+    domains: [gdg.community.dev]
     trust: high
     online_allowed: true
     source_profiles: [gdg_bengaluru]
@@ -25,10 +25,10 @@ organizers:
     source_profiles: [nvidia_developer]
   - name: Cloud Native Computing Foundation
     aliases: [CNCF, Kubernetes]
-    domains: [cncf.io]
+    domains: [cncf.io, community.cncf.io]
     trust: high
     online_allowed: true
-    source_profiles: [cncf_events]
+    source_profiles: [cncf_events, cncf_bengaluru]
   - name: Hasgeek
     aliases: [HasGeek]
     domains: [hasgeek.com]
@@ -44,3 +44,57 @@ organizers:
     domains: []
     trust: medium
     online_allowed: false
+  - name: FOSS United
+    aliases: [FOSS United Foundation, FOSSUnited]
+    domains: [fossunited.org, platform.fossunited.org]
+    trust: high
+    online_allowed: true
+    source_profiles: [foss_united_bengaluru]
+  - name: Global AI Community
+    aliases: [Global AI, GlobalAI]
+    domains: [globalai.community]
+    trust: high
+    online_allowed: true
+    source_profiles: [global_ai_bengaluru]
+  - name: Atlassian Community
+    aliases: [Atlassian, Atlassian Community Events]
+    domains: [atlassian.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [atlassian_bangalore]
+  - name: Open Source India
+    aliases: [OpenSource India, OSI Days]
+    domains: [opensourceindia.in]
+    trust: high
+    online_allowed: false
+    source_profiles: [open_source_india]
+  - name: Google for Developers
+    aliases: [Google Developers, Google Search Central]
+    domains: [developers.google.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [google_search_central, google_developers]
+  - name: Salesforce Developers
+    aliases: [Salesforce, Salesforce Developer]
+    domains: [developer.salesforce.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [salesforce_developer_events]
+  - name: Docker
+    aliases: [Docker Inc, Docker Community]
+    domains: [docker.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [docker_events]
+  - name: Red Hat
+    aliases: [Red Hat Events, Red Hat Developer]
+    domains: [redhat.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [red_hat_events]
+  - name: Databricks
+    aliases: [Databricks Events, Data + AI Summit]
+    domains: [databricks.com]
+    trust: high
+    online_allowed: true
+    source_profiles: [databricks_events]

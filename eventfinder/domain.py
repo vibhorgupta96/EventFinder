@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
+from math import isfinite
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -38,20 +39,43 @@ class EventType(StrEnum):
     UNKNOWN = "unknown"
 
 
-def has_explicit_paid_price(value: str | None) -> bool:
+def normalize_price(value: Any) -> str | None:
+    """Normalize only finite, explicitly supplied price scalar values."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not isfinite(value):
+            return None
+        return str(int(value)) if value.is_integer() else str(value)
+    if isinstance(value, str):
+        return " ".join(value.split()) or None
+    return None
+
+
+def has_explicit_paid_price(value: Any) -> bool:
     """Recognize only affirmative price evidence; missing price remains unknown."""
 
-    price = " ".join((value or "").casefold().split())
-    if not price or any(word in price for word in ("free", "no cost", "nada")):
+    normalized = normalize_price(value)
+    price = normalized.casefold() if normalized else ""
+    if not price:
         return False
     currency = r"(?:₹|\$|€|£|inr|usd|rs\.?)"
-    zero = rf"{currency}\s*0(?:\.0+)?(?:\s+(?:onwards|from))?"
-    if re.fullmatch(zero, price) or re.fullmatch(r"0(?:\.0+)?", price):
-        return False
+    number = r"(\d+(?:\.\d+)?)"
+    amounts = re.findall(rf"(?:{currency}\s*{number}|{number}\s*{currency})", price)
+    numeric_amounts = [next(amount for amount in match if amount) for match in amounts]
+    if any(float(amount) > 0 for amount in numeric_amounts):
+        return True
     if re.search(r"\bpaid(?:\s+admission)?\b", price):
         return True
-    if re.search(rf"{currency}\s*\d+(?:\.\d+)?", price):
-        return True
+    if any(word in price for word in ("free", "no cost", "nada")):
+        return False
+    if re.fullmatch(rf"{currency}\s*0(?:\.0+)?(?:\s+(?:onwards|from))?", price):
+        return False
+    if re.fullmatch(r"0(?:\.0+)?", price):
+        return False
     # The price field itself supplies the context for a bare price range or
     # an explicit "from/onwards" amount; do not infer payment from prose.
     return bool(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -23,6 +24,22 @@ from eventfinder.repository import (
 )
 from eventfinder.sources import RequestLimiter, RobotsPolicy, SourceFetchError, make_source
 from eventfinder.urls import URLSafety
+
+
+def _detail_hydration_error(result) -> tuple[str | None, int]:
+    """Summarize bounded detail-page failures without failing other sources."""
+
+    reasons = [
+        str(evidence.facts["rejected"])
+        for evidence in result.source_evidence
+        if evidence.facts.get("page_kind") == "detail" and evidence.facts.get("rejected")
+    ]
+    if not reasons:
+        return None, 0
+    counts = Counter(reasons)
+    rendered = "; ".join(f"{count} {reason}" for reason, count in sorted(counts.items()))
+    pages = "page" if len(reasons) == 1 else "pages"
+    return f"detail hydration rejected {len(reasons)} {pages}: {rendered}", len(reasons)
 
 
 class DiscoveryService:
@@ -121,20 +138,36 @@ class DiscoveryService:
                     review += 1
                 else:
                     rejected += 1
+            detail_error, detail_errors = _detail_hydration_error(result)
             zero_parse_error = (
                 "priority source returned zero candidates or interstitial page"
-                if definition.priority and not result.candidates
+                if definition.priority and not result.candidates and not detail_error
                 else None
             )
+            run_error = "; ".join(
+                part
+                for part in (
+                    detail_error,
+                    zero_parse_error,
+                    f"{candidate_errors} candidate errors" if candidate_errors else None,
+                )
+                if part
+            ) or None
             finish_source_run(
                 session,
                 run,
                 fetched_count=len(result.candidates),
                 accepted_count=accepted,
                 rejected_count=rejected,
-                error=zero_parse_error or (f"{candidate_errors} candidate errors" if candidate_errors else None),
+                error=run_error,
             )
-            return {"fetched": len(result.candidates), "accepted": accepted, "review": review, "rejected": rejected, "errors": candidate_errors}
+            return {
+                "fetched": len(result.candidates),
+                "accepted": accepted,
+                "review": review,
+                "rejected": rejected,
+                "errors": candidate_errors + detail_errors,
+            }
 
     async def _persist_candidate(self, session: Session, candidate: EventCandidate) -> str:
         existing = find_existing(session, candidate)

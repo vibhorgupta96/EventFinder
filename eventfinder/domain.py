@@ -10,6 +10,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from eventfinder.urls import UnsafeURL, normalize_url
+
 
 class EventFormat(StrEnum):
     IN_PERSON = "in_person"
@@ -126,7 +128,17 @@ class EventCandidate(BaseModel):
     @field_validator("canonical_url", "source_url", "registration_url", mode="before")
     @classmethod
     def strip_urls(cls, value: str | None) -> str | None:
-        return value.strip() if isinstance(value, str) else value
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        # Defensive dedupe normalization only: a non-http(s) value or one
+        # that otherwise fails URL safety is returned untouched so the
+        # dedicated validators/``safety.validate`` still run and can reject
+        # it with the real reason, never silently swallowed here.
+        try:
+            return normalize_url(stripped)
+        except UnsafeURL:
+            return stripped
 
     @field_validator(
         "starts_at",

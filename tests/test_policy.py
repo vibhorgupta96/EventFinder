@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from eventfinder.ai import AIUnavailable
 from eventfinder.domain import EventFormat, EventType
-from eventfinder.policy import assess_candidate, match_organizer
+from eventfinder.policy import _within_window, assess_candidate, match_organizer
 
 
 @pytest.mark.asyncio
@@ -157,3 +157,82 @@ async def test_ai_outage_leaves_ambiguous_candidate_for_review(candidate, config
 
     assessment = await assess_candidate(candidate, config, organizers, classifier=Unavailable())
     assert assessment.status == "needs_review"
+
+
+def test_within_window_near_future_boundary_is_inclusive(candidate, config):
+    now = datetime.now(UTC)
+    candidate.ends_at = None
+
+    candidate.starts_at = now + timedelta(days=config.policy.near_future_days)
+    assert _within_window(candidate, config, now) is True
+
+    candidate.starts_at = now + timedelta(days=config.policy.near_future_days) + timedelta(seconds=1)
+    assert _within_window(candidate, config, now) is False
+
+
+@pytest.mark.asyncio
+async def test_assess_candidate_near_future_boundary_is_inclusive(candidate, config, organizers):
+    now = datetime.now(UTC)
+    candidate.ends_at = None
+
+    candidate.starts_at = now + timedelta(days=config.policy.near_future_days)
+    assert (await assess_candidate(candidate, config, organizers, now=now)).status == "eligible"
+
+    candidate.starts_at = now + timedelta(days=config.policy.near_future_days) + timedelta(seconds=1)
+    assessment = await assess_candidate(candidate, config, organizers, now=now)
+    assert assessment.status == "needs_review"
+    assert assessment.reason == "Missing or out-of-window start time"
+
+
+def test_within_window_visibility_end_boundary(candidate, config):
+    now = datetime.now(UTC)
+    # An ongoing multi-day event: it started in the past, so the near-future
+    # check on starts_at trivially passes and only the visibility_end cutoff
+    # (ends_at < now - 1 day) is exercised.
+    candidate.starts_at = now - timedelta(days=10)
+
+    candidate.ends_at = now - timedelta(days=1)
+    assert _within_window(candidate, config, now) is True
+
+    candidate.ends_at = now - timedelta(days=1) - timedelta(seconds=1)
+    assert _within_window(candidate, config, now) is False
+
+
+def test_within_window_newly_opened_extension_boundary(candidate, config):
+    now = datetime.now(UTC)
+    candidate.ends_at = None
+    # Beyond near_future_days so only the newly-opened extension can admit it.
+    candidate.starts_at = now + timedelta(days=config.policy.near_future_days + 100)
+
+    candidate.registration_opened_at = now - timedelta(days=config.policy.registration_opened_days)
+    assert _within_window(candidate, config, now) is True
+
+    candidate.registration_opened_at = now - timedelta(days=config.policy.registration_opened_days + 1)
+    assert _within_window(candidate, config, now) is False
+
+
+def test_within_window_newly_opened_extension_start_boundary(candidate, config):
+    now = datetime.now(UTC)
+    candidate.ends_at = None
+    candidate.registration_opened_at = now - timedelta(days=1)
+
+    candidate.starts_at = now + timedelta(days=config.policy.newly_opened_extended_days)
+    assert _within_window(candidate, config, now) is True
+
+    candidate.starts_at = now + timedelta(days=config.policy.newly_opened_extended_days) + timedelta(days=1)
+    assert _within_window(candidate, config, now) is False
+
+
+@pytest.mark.asyncio
+async def test_assess_candidate_newly_opened_extension_boundary(candidate, config, organizers):
+    now = datetime.now(UTC)
+    candidate.ends_at = None
+    candidate.starts_at = now + timedelta(days=config.policy.near_future_days + 100)
+
+    candidate.registration_opened_at = now - timedelta(days=config.policy.registration_opened_days)
+    assert (await assess_candidate(candidate, config, organizers, now=now)).status == "eligible"
+
+    candidate.registration_opened_at = now - timedelta(days=config.policy.registration_opened_days + 1)
+    assessment = await assess_candidate(candidate, config, organizers, now=now)
+    assert assessment.status == "needs_review"
+    assert assessment.reason == "Missing or out-of-window start time"

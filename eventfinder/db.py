@@ -29,6 +29,9 @@ def make_engine(database_url: str | None = None):
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA journal_mode=WAL")
+            # Let writers wait up to 5s for a lock instead of failing
+            # immediately under contention (e.g. concurrent discovery writes).
+            cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
     return engine
 

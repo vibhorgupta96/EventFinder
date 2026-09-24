@@ -79,6 +79,8 @@ sources:
     priority: true
     cadence_hours: 6
     rate_limit_seconds: 3
+    source_timezone: America/Los_Angeles
+    date_dayfirst: false
   - name: aws_events
     adapter: public_page
     platform: official
@@ -88,6 +90,8 @@ sources:
     priority: false
     cadence_hours: 6
     rate_limit_seconds: 3
+    source_timezone: America/Los_Angeles
+    date_dayfirst: false
   - name: nvidia_developer
     adapter: public_page
     platform: official
@@ -97,6 +101,8 @@ sources:
     priority: false
     cadence_hours: 12
     rate_limit_seconds: 3
+    source_timezone: America/Los_Angeles
+    date_dayfirst: false
   - name: github_events
     adapter: public_page
     platform: official
@@ -106,6 +112,8 @@ sources:
     priority: false
     cadence_hours: 12
     rate_limit_seconds: 3
+    source_timezone: America/Los_Angeles
+    date_dayfirst: false
   - name: cncf_events
     adapter: public_page
     platform: official
@@ -115,6 +123,8 @@ sources:
     priority: false
     cadence_hours: 12
     rate_limit_seconds: 3
+    source_timezone: America/Los_Angeles
+    date_dayfirst: false
   # Recurring Bengaluru communities. Detail links are explicit and capped; no
   # source uses inferred pagination.
   - name: foss_united_bengaluru
@@ -198,6 +208,8 @@ sources:
     priority: false
     cadence_hours: 12
     rate_limit_seconds: 3
+    source_timezone: America/Los_Angeles
+    date_dayfirst: false
   - name: google_developers
     adapter: public_page
     platform: official
@@ -211,6 +223,8 @@ sources:
     priority: false
     cadence_hours: 12
     rate_limit_seconds: 3
+    source_timezone: America/Los_Angeles
+    date_dayfirst: false
   - name: salesforce_developer_events
     adapter: public_page
     platform: official
@@ -255,3 +269,5 @@ sources:
     priority: false
     cadence_hours: 12
     rate_limit_seconds: 3
+    source_timezone: America/Los_Angeles
+    date_dayfirst: false

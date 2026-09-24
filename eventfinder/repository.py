@@ -6,11 +6,17 @@ import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from eventfinder.domain import EventCandidate, RegistrationState, has_explicit_paid_price
 from eventfinder.models import Event, EventChange, EventSource, SourceRun, utcnow
 from eventfinder.policy import Assessment
+
+# Mirrors the alias set in policy.BENGALURU_PATTERN (kept independent so this
+# module can build a SQL-level, case-insensitive LIKE predicate over the
+# stored city/venue columns rather than re-matching free text in Python).
+BENGALURU_ALIASES = ("bengaluru", "bangalore", "blr")
 
 MATERIAL_FIELDS = {
     "registration_state": "registration_state",
@@ -247,12 +253,14 @@ def _phrase_match(needle: str, haystack: str) -> bool:
     return bool(re.search(rf"(?<!\w){re.escape(needle.casefold())}(?!\w)", haystack.casefold()))
 
 
-def list_events(session: Session, *, text: str | None = None, topic: str | None = None, event_type: str | None = None, organizer: str | None = None, event_format: str | None = None, registration_state: str | None = None, source: str | None = None, start_after: datetime | None = None, start_before: datetime | None = None, status: str | None = None, limit: int = 100) -> list[Event]:
+def list_events(session: Session, *, text: str | None = None, topic: str | None = None, event_type: str | None = None, event_types: list[str] | None = None, organizer: str | None = None, event_format: str | None = None, registration_state: str | None = None, source: str | None = None, start_after: datetime | None = None, start_before: datetime | None = None, opened_after: datetime | None = None, bengaluru_only: bool = False, status: str | None = None, limit: int = 100) -> list[Event]:
     statement = select(Event).where(Event.status == (status or "eligible"))
     if text:
         statement = statement.where((Event.title.ilike(f"%{text}%")) | (Event.description.ilike(f"%{text}%")))
     if event_type:
         statement = statement.where(Event.event_type == event_type)
+    if event_types:
+        statement = statement.where(Event.event_type.in_(event_types))
     if organizer:
         statement = statement.where(Event.organizer.ilike(f"%{organizer}%"))
     if event_format:
@@ -263,6 +271,16 @@ def list_events(session: Session, *, text: str | None = None, topic: str | None 
         statement = statement.where(Event.starts_at >= start_after)
     if start_before:
         statement = statement.where(Event.starts_at <= start_before)
+    if opened_after:
+        # Either column can carry the "registration opened" fact depending on
+        # whether the open transition was explicitly dated or only observed.
+        statement = statement.where(
+            or_(Event.registration_opened_at >= opened_after, Event.first_observed_open_at >= opened_after)
+        )
+    if bengaluru_only:
+        statement = statement.where(
+            or_(*(or_(Event.city.ilike(f"%{alias}%"), Event.venue.ilike(f"%{alias}%")) for alias in BENGALURU_ALIASES))
+        )
     events = [
         event
         for event in session.exec(statement).all()

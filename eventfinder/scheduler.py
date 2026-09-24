@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
@@ -19,6 +21,9 @@ class EventFinderScheduler:
         self.digest = digest
         self.config = config
         self.scheduler = AsyncIOScheduler(timezone=config.timezone)
+        # Guards discovery so a long-running run started by the scheduled job
+        # or the startup refresh can never overlap the other.
+        self._discovery_lock = asyncio.Lock()
 
     @property
     def running(self) -> bool:
@@ -26,8 +31,9 @@ class EventFinderScheduler:
 
     async def discover_and_refresh(self) -> None:
         try:
-            await self.discovery.run_discovery()
-            await self.discovery.refresh_known_events()
+            async with self._discovery_lock:
+                await self.discovery.run_discovery()
+                await self.discovery.refresh_known_events()
         except Exception:
             logger.exception("Scheduled discovery failed")
 
@@ -51,8 +57,9 @@ class EventFinderScheduler:
         # Startup deliberately performs one fresh read-only discovery rather
         # than waiting for the cadence recorded by a previous process.
         try:
-            await self.discovery.run_discovery(force=True)
-            await self.discovery.refresh_known_events()
+            async with self._discovery_lock:
+                await self.discovery.run_discovery(force=True)
+                await self.discovery.refresh_known_events()
         except Exception:
             logger.exception("Startup discovery failed")
         await self.retry_digest()

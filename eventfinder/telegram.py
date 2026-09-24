@@ -29,11 +29,26 @@ class TelegramHTTPClient:
         self.token, self.chat_id, self.client = token, chat_id, client
 
     async def send(self, body: str) -> str:
-        response = await self.client.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.chat_id, "text": body, "disable_web_page_preview": True}, timeout=20)
-        response.raise_for_status()
+        try:
+            response = await self.client.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.chat_id, "text": body, "disable_web_page_preview": True}, timeout=20)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            description = None
+            try:
+                description = error.response.json().get("description")
+            except ValueError:
+                description = None
+            message = f"Telegram request failed (status {error.response.status_code})"
+            if description:
+                message += f": {description}"
+            raise RuntimeError(message.replace(self.token, "***")) from None
+        except httpx.HTTPError as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            message = "Telegram request failed" + (f" (status {status})" if status else "")
+            raise RuntimeError(message.replace(self.token, "***")) from None
         payload = response.json()
         if not payload.get("ok"):
-            raise RuntimeError(payload.get("description", "Telegram rejected the message"))
+            raise RuntimeError(str(payload.get("description", "Telegram rejected the message")).replace(self.token, "***"))
         return str(payload["result"]["message_id"])
 
 
@@ -60,15 +75,26 @@ def _time(value: datetime | None) -> str:
     return _as_utc(value).astimezone(IST).strftime("%a, %d %b · %-I:%M %p IST") if value else "Time not stated"
 
 
+def _capped(value: str | None, limit: int) -> str | None:
+    """Truncate a scraped field so one pathological value can't dominate a chunk."""
+
+    if value is None or len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "…"
+
+
 def _format_event(event: Event, changes: list[EventChange]) -> str:
-    lines = [f"• {event.title}", f"  {_time(event.starts_at)} · {event.format.replace('_', ' ')}"]
-    if event.venue or event.city:
-        lines.append(f"  {event.venue or event.city}")
+    title = _capped(event.title, 300)
+    venue = _capped(event.venue or event.city, 200)
+    price_text = _capped(event.price_text, 120)
+    lines = [f"• {title}", f"  {_time(event.starts_at)} · {event.format.replace('_', ' ')}"]
+    if venue:
+        lines.append(f"  {venue}")
     if event.registration_deadline:
         lines.append(f"  Register by {_time(event.registration_deadline)}")
     if event.approval_required:
         lines.append("  Approval required")
-    lines.append("  Price not stated" if event.price_status == "not_stated" else "  Free" if event.price_status == "free" else f"  {event.price_text or 'Paid'}")
+    lines.append("  Price not stated" if event.price_status == "not_stated" else "  Free" if event.price_status == "free" else f"  {price_text or 'Paid'}")
     lines.append("  Updated: " + ", ".join(sorted({c.change_type.replace("_", " ") for c in changes})))
     if link := safe_outbound_url(event.registration_url or event.canonical_url):
         lines.append(f"  {link}")
@@ -87,7 +113,8 @@ def split_message(text: str, limit: int = TELEGRAM_SAFE_LIMIT) -> list[str]:
         if current:
             chunks.append(current)
         while len(block) > limit:
-            point = max(block.rfind("\n", 0, limit), 1)
+            point = block.rfind("\n", 0, limit)
+            point = limit if point <= 0 else point
             chunks.append(block[:point])
             block = block[point:].lstrip("\n")
         current = block
@@ -186,9 +213,11 @@ class DigestService:
         pending = [d for d in deliveries if not d.sent_at]
         if pending:
             if all(delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS for delivery in pending):
+                # Permanent failure: leave the underlying EventChanges un-digested so
+                # they roll into the next day's digest instead of being silently dropped.
                 run.status, run.completed_at = "failed", utcnow()
                 session.add(run)
-                mark_changes_digested(session, [change for change, _ in self._run_pairs(session, run)])
+                session.commit()
                 return {
                     "status": "failed",
                     "events": len(grouped),

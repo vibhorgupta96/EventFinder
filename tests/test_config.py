@@ -107,6 +107,22 @@ def test_source_config_rejects_invalid_adapter_url_detail_and_duplicate_contract
         SourcesRegistry(sources=[source, source])
 
 
+def test_source_definition_rejects_an_unknown_iana_timezone():
+    with pytest.raises(ValidationError, match="unknown IANA timezone"):
+        SourceDefinition(
+            name="bad_timezone",
+            adapter="public_page",
+            url="https://events.example.test/",
+            source_timezone="Not/ARealZone",
+        )
+
+
+def test_source_definition_defaults_to_ist_and_dayfirst():
+    source = SourceDefinition(name="default_tz", adapter="public_page", url="https://events.example.test/")
+    assert source.source_timezone == "Asia/Kolkata"
+    assert source.date_dayfirst is True
+
+
 def test_cross_registry_source_profiles_must_reference_real_sources():
     sources = SourcesRegistry(
         sources=[SourceDefinition(name="known_source", adapter="public_page", url="https://events.example.test/")]

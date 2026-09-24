@@ -3,11 +3,18 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
-from eventfinder.models import DigestDelivery, DigestRun, Event
+from eventfinder.models import DigestDelivery, DigestRun, Event, EventChange
 from eventfinder.policy import assess_candidate
 from eventfinder.repository import upsert_candidate
-from eventfinder.telegram import DigestService, _urgency, split_message
+from eventfinder.telegram import (
+    DigestService,
+    TelegramHTTPClient,
+    _format_event,
+    _urgency,
+    split_message,
+)
 from sqlmodel import select
 
 
@@ -157,3 +164,89 @@ async def test_exhausted_digest_is_observable_and_does_not_block_a_new_day(sessi
     upsert_candidate(session, changed, await assess_candidate(changed, config, organizers))
     assert (await service.send_daily_digest(now=datetime(2026, 9, 24, 3, tzinfo=UTC)))["status"] == "partial"
     assert len(list(session.exec(select(DigestRun)))) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_run_does_not_drop_changes(session, candidate, config, organizers):
+    """A permanently failed run must leave EventChanges un-digested so they roll forward."""
+
+    class AlwaysFail:
+        async def send(self, _body: str) -> str:
+            raise RuntimeError("Telegram unavailable")
+
+    upsert_candidate(session, candidate, await assess_candidate(candidate, config, organizers))
+    service = DigestService(lambda: session, AlwaysFail())
+    assert (await service.send_daily_digest(now=datetime(2026, 9, 23, 3, tzinfo=UTC)))["status"] == "partial"
+    assert (await service.send_daily_digest(now=datetime(2026, 9, 23, 3, 3, tzinfo=UTC)))["status"] == "partial"
+    failed = await service.send_daily_digest(now=datetime(2026, 9, 23, 3, 7, tzinfo=UTC))
+    assert failed["status"] == "failed"
+
+    still_pending = list(session.exec(select(EventChange)))
+    assert still_pending
+    assert all(change.digested_at is None for change in still_pending)
+    pending_ids = {change.id for change in still_pending}
+
+    service.sender = Sender()
+    resumed = await service.send_daily_digest(now=datetime(2026, 9, 24, 3, tzinfo=UTC))
+    assert resumed["status"] == "sent"
+
+    next_run = session.exec(select(DigestRun).where(DigestRun.digest_date == "2026-09-24")).one()
+    assert pending_ids <= set(next_run.event_change_ids)
+
+    digested = list(session.exec(select(EventChange)))
+    assert all(change.digested_at is not None for change in digested)
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_never_leaks_bot_token(session, candidate, config, organizers):
+    token = "123456789:AA-Secret-Bot-Token-Value"  # noqa: S105 - fixture value, not a real credential
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert token in str(request.url)
+        return httpx.Response(400, json={"ok": False, "description": "Bad Request: chat not found"})
+
+    upsert_candidate(session, candidate, await assess_candidate(candidate, config, organizers))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sender = TelegramHTTPClient(token, "chat-id", client)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await sender.send("hello")
+        message = str(exc_info.value)
+        assert token not in message
+        assert "400" in message
+        assert "chat not found" in message
+
+        service = DigestService(lambda: session, sender)
+        result = await service.send_daily_digest(now=datetime(2026, 9, 23, 3, tzinfo=UTC))
+
+    assert result["status"] == "partial"
+    delivery = session.exec(select(DigestDelivery)).one()
+    assert delivery.error is not None
+    assert token not in delivery.error
+    assert "400" in delivery.error
+
+
+def test_split_message_hard_slices_newline_less_over_long_block():
+    block = "x" * 5000
+    chunks = split_message(block, limit=1000)
+    assert len(chunks) == 5
+    assert all(len(chunk) == 1000 for chunk in chunks)
+    assert "".join(chunks) == block
+
+
+def test_format_event_truncates_overlong_fields():
+    event = Event(
+        canonical_url="https://events.example.test/overlong",
+        normalized_key="overlong",
+        title="T" * 500,
+        venue="V" * 400,
+        price_text="P" * 300,
+        price_status="paid",
+    )
+    body = _format_event(event, [])
+    assert "T" * 500 not in body
+    assert "V" * 400 not in body
+    assert "P" * 300 not in body
+    assert "…" in body
+    first_line = body.splitlines()[0]
+    assert len(first_line) <= len("• ") + 301

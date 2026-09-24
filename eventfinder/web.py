@@ -11,9 +11,10 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from loguru import logger
 from sqlmodel import Session, select
 
 from eventfinder.ai import make_classifier
@@ -29,7 +30,7 @@ from eventfinder.repository import list_events, source_health
 from eventfinder.scheduler import EventFinderScheduler
 from eventfinder.service import DiscoveryService
 from eventfinder.telegram import make_digest_service
-from eventfinder.urls import safe_outbound_url
+from eventfinder.urls import URLSafeTransport, safe_outbound_url
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
@@ -77,33 +78,24 @@ def _event_payload(event: Event) -> dict[str, object]:
 
 def _sections(session: Session, limit: int) -> dict[str, list[Event]]:
     now = datetime.now(UTC)
-    all_events = list_events(session, limit=limit)
     return {
-        "Upcoming": all_events,
-        "Registration opened": [
-            event
-            for event in all_events
-            if (
-                event.registration_opened_at or event.first_observed_open_at
-            )
-            and (event.registration_opened_at or event.first_observed_open_at)
-            >= now - timedelta(days=7)
-        ],
-        "Online": [event for event in all_events if event.format == "online"],
-        "Bengaluru": [
-            event
-            for event in all_events
-            if any(alias in " ".join(filter(None, [event.city, event.venue])).lower() for alias in ("bengaluru", "bangalore", "blr"))
-        ],
-        "Hackathons": [
-            event for event in all_events if event.event_type in {"hackathon", "buildathon", "competition"}
-        ],
+        "Upcoming": list_events(session, limit=limit),
+        "Registration opened": list_events(session, opened_after=now - timedelta(days=7), limit=limit),
+        "Online": list_events(session, event_format="online", limit=limit),
+        "Bengaluru": list_events(session, bengaluru_only=True, limit=limit),
+        "Hackathons": list_events(
+            session, event_types=["hackathon", "buildathon", "competition"], limit=limit
+        ),
         "Needs review": list_events(session, status="needs_review", limit=limit),
     }
 
 
 def create_app(
-    *, database_url: str | None = None, start_scheduler: bool = True, client: httpx.AsyncClient | None = None
+    *,
+    database_url: str | None = None,
+    start_scheduler: bool = True,
+    client: httpx.AsyncClient | None = None,
+    fetch_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     settings = get_settings()
     file_config = get_file_config()
@@ -111,13 +103,34 @@ def create_app(
     organizers = get_organizers_registry()
     engine = make_engine(database_url)
     managed_client = client is None
+    managed_fetch_client = fetch_client is None
+    # Trusted, fixed-destination integrations (Telegram, Gemini/Groq) never
+    # need DNS pinning; only discovery fetches arbitrary public-source URLs
+    # and therefore gets the SSRF-hardened, DNS-pinned transport.
     http_client = client or httpx.AsyncClient(timeout=httpx.Timeout(20.0))
+    # URLSafeTransport pins every request's connection to a validated IP, but
+    # httpcore keys keepalive pool reuse by (scheme, host, port) using that
+    # pinned IP and ignores the `sni_hostname` extension. Two distinct source
+    # hostnames that share an IP (e.g. behind a common CDN) could otherwise
+    # have a keepalive TLS connection negotiated/verified for host A reused
+    # for a request to host B, letting B ride a TLS channel authenticated for
+    # A. Disabling keepalive reuse forces a fresh, freshly-verified
+    # connection per request instead. This must be applied to the transport
+    # actually performing the pinned request (URLSafeTransport's inner
+    # transport) since passing `limits=` to AsyncClient has no effect once a
+    # custom `transport=` is supplied.
+    discovery_limits = httpx.Limits(max_connections=20, max_keepalive_connections=0)
+    discovery_client = fetch_client or httpx.AsyncClient(
+        transport=URLSafeTransport(inner=httpx.AsyncHTTPTransport(limits=discovery_limits)),
+        timeout=httpx.Timeout(20.0),
+        limits=discovery_limits,
+    )
 
     def session_factory() -> Session:
         return Session(engine)
 
     classifier = make_classifier(settings, file_config.ai, http_client)
-    discovery = DiscoveryService(session_factory, file_config, sources, organizers, http_client, classifier)
+    discovery = DiscoveryService(session_factory, file_config, sources, organizers, discovery_client, classifier)
     digest = make_digest_service(settings, session_factory, http_client, file_config.ranking.digest_limit)
     scheduler = EventFinderScheduler(discovery, digest, file_config.scheduler)
 
@@ -141,6 +154,8 @@ def create_app(
             scheduler.shutdown()
             if managed_client:
                 await http_client.aclose()
+            if managed_fetch_client:
+                await discovery_client.aclose()
 
     app = FastAPI(title="EventFinder", version="0.1.0", lifespan=lifespan)
     app.state.engine = engine
@@ -201,13 +216,18 @@ def create_app(
     @app.get("/healthz")
     def healthz():
         now = datetime.now(UTC)
-        database_ok = True
         try:
             with session_factory() as session:
                 session.exec(select(Event.id).limit(1)).first()
                 health = source_health(session)
-        except Exception as error:
-            return {"status": "degraded", "database": "error", "detail": str(error), "scheduler": scheduler.running}
+        except Exception:
+            # Never leak internal exception text/paths in a public health
+            # response; a static per-component label is sufficient signal.
+            logger.exception("Health check database probe failed")
+            return JSONResponse(
+                status_code=503,
+                content={"status": "degraded", "database": "error", "scheduler": scheduler.running},
+            )
         priority_names = {source.name for source in sources.sources if source.priority and source.enabled}
         fresh_priority = {
             item["source_name"]
@@ -222,13 +242,14 @@ def create_app(
             )
             >= now - timedelta(hours=file_config.scheduler.discovery_hours * 2)
         }
-        status = "ok" if scheduler.running and fresh_priority else "degraded"
-        return {
-            "status": status,
-            "database": "ok" if database_ok else "error",
+        healthy = scheduler.running and bool(fresh_priority)
+        payload = {
+            "status": "ok" if healthy else "degraded",
+            "database": "ok",
             "scheduler": scheduler.running,
             "priority_sources_fresh": len(fresh_priority),
             "priority_sources_total": len(priority_names),
         }
+        return payload if healthy else JSONResponse(status_code=503, content=payload)
 
     return app

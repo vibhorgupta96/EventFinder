@@ -3,7 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from eventfinder.domain import EventFormat, RegistrationState
+from eventfinder.domain import (
+    EventCandidate,
+    EventFormat,
+    RegistrationState,
+    SourceEvidence,
+)
 from eventfinder.models import Event, EventChange, EventSource
 from eventfinder.policy import assess_candidate
 from eventfinder.repository import (
@@ -34,6 +39,57 @@ async def test_cross_postings_dedupe_and_retain_provenance(session, candidate, c
     sources = list(session.exec(select(EventSource).where(EventSource.event_id == event.id)).all())
     assert {source.source_name for source in sources} == {"gdg_bengaluru", "luma_bengaluru"}
     assert len(list_events(session, source="luma")) == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_posting_differing_only_by_utm_param_and_host_case_dedupes(
+    session, candidate, config, organizers
+):
+    """``EventCandidate`` normalizes ``canonical_url`` at construction time, so a
+    cross-posting whose URL differs only by tracking-param noise or host case
+    must still resolve to the same event via ``find_existing``'s exact
+    ``canonical_url`` match, not a distinct row.
+    """
+    assessment = await assess_candidate(candidate, config, organizers)
+    event, _, created = upsert_candidate(session, candidate, assessment)
+    assert created is True
+
+    # A model_copy() with a later plain attribute assignment would bypass the
+    # ``strip_urls`` validator entirely, so this cross-posting is built via
+    # the constructor (like the ``candidate`` fixture) to exercise the real
+    # normalization path.
+    cross_posting = EventCandidate(
+        title=candidate.title,
+        canonical_url="https://EVENTS.example.test/ai-systems?utm_source=newsletter",
+        # A distinct source domain keeps this test isolated to canonical_url
+        # dedupe via ``find_existing``; the ``utm_campaign``/host-case noise
+        # still exercises the same ``normalize_url`` defensive path.
+        source_url="https://LUMA.example.test/e/ai-systems?utm_campaign=weekly",
+        source_name="luma_bengaluru",
+        organizer=candidate.organizer,
+        description=candidate.description,
+        starts_at=candidate.starts_at,
+        city=candidate.city,
+        venue=candidate.venue,
+        format=candidate.format,
+        event_type=candidate.event_type,
+        registration_state=candidate.registration_state,
+        speakers=candidate.speakers,
+        topics=candidate.topics,
+        evidence=SourceEvidence(
+            source_name="luma_bengaluru",
+            source_url="https://LUMA.example.test/e/ai-systems?utm_campaign=weekly",
+            observed_at=datetime.now(UTC),
+        ),
+    )
+    assert cross_posting.canonical_url == candidate.canonical_url
+
+    same_event, changes, created = upsert_candidate(session, cross_posting, assessment)
+    assert created is False
+    assert same_event.id == event.id
+    assert not changes
+    sources = list(session.exec(select(EventSource).where(EventSource.event_id == event.id)).all())
+    assert {source.source_name for source in sources} == {"gdg_bengaluru", "luma_bengaluru"}
 
 
 @pytest.mark.asyncio
@@ -213,6 +269,62 @@ async def test_multi_day_event_remains_visible_until_its_end(session, candidate,
     assert event.status == "eligible"
     assert event in list_events(session)
     assert expire_past_events(session) == 0
+
+
+def test_list_events_event_types_opened_after_and_bengaluru_filters_are_backward_compatible(session):
+    now = datetime.now(UTC)
+    bengaluru_hackathon = Event(
+        canonical_url="https://events.example.test/blr-hackathon",
+        normalized_key="blr-hackathon",
+        title="Bengaluru Robotics Hackathon",
+        event_type="hackathon",
+        city="Bengaluru",
+        venue="BLR Convention Centre",
+        starts_at=now + timedelta(days=10),
+        first_observed_open_at=now - timedelta(days=1),
+        status="eligible",
+    )
+    remote_meetup = Event(
+        canonical_url="https://events.example.test/remote-meetup",
+        normalized_key="remote-meetup",
+        title="Remote Systems Meetup",
+        event_type="meetup",
+        city="Hyderabad",
+        venue="Tech Park",
+        starts_at=now + timedelta(days=10),
+        first_observed_open_at=now - timedelta(days=30),
+        status="eligible",
+    )
+    case_insensitive_bengaluru = Event(
+        canonical_url="https://events.example.test/bangalore-workshop",
+        normalized_key="bangalore-workshop",
+        title="Bangalore AI Workshop",
+        event_type="workshop",
+        city="BANGALORE",
+        venue=None,
+        starts_at=now + timedelta(days=10),
+        registration_opened_at=now - timedelta(hours=1),
+        status="eligible",
+    )
+    session.add_all([bengaluru_hackathon, remote_meetup, case_insensitive_bengaluru])
+    session.commit()
+
+    # Existing no-arg behavior is unchanged: all three eligible events return.
+    assert {event.id for event in list_events(session)} == {
+        bengaluru_hackathon.id,
+        remote_meetup.id,
+        case_insensitive_bengaluru.id,
+    }
+
+    by_type = list_events(session, event_types=["hackathon", "workshop"])
+    assert {event.id for event in by_type} == {bengaluru_hackathon.id, case_insensitive_bengaluru.id}
+
+    recently_opened = list_events(session, opened_after=now - timedelta(days=7))
+    assert {event.id for event in recently_opened} == {bengaluru_hackathon.id, case_insensitive_bengaluru.id}
+
+    bengaluru_only = list_events(session, bengaluru_only=True)
+    assert {event.id for event in bengaluru_only} == {bengaluru_hackathon.id, case_insensitive_bengaluru.id}
+    assert remote_meetup.id not in {event.id for event in bengaluru_only}
 
 
 @pytest.mark.asyncio

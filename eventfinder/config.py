@@ -6,6 +6,7 @@ import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -99,6 +100,23 @@ class SourceDefinition(BaseModel):
     # from the page-fetch redirect boundary. An empty list defaults at runtime
     # to the source's own allowed domains.
     allowed_registration_domains: list[str] = Field(default_factory=list)
+    # Naive (timezone-less) dates on this source's pages are factually local to
+    # this IANA zone; this never overrides a date that already carries an
+    # explicit offset/timezone in the source evidence.
+    source_timezone: str = "Asia/Kolkata"
+    # Ambiguous numeric dates (e.g. 03/04/2026) on this source are interpreted
+    # day-first (India/most-of-world convention) unless disabled for sources
+    # that publish month-first (US) dates.
+    date_dayfirst: bool = True
+
+    @field_validator("source_timezone")
+    @classmethod
+    def validate_source_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as error:
+            raise ValueError(f"unknown IANA timezone: {value}") from error
+        return value
 
     @field_validator("url", "profile_url")
     @classmethod

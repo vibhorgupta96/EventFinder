@@ -10,10 +10,14 @@ from eventfinder.config import SourceDefinition, get_sources_registry
 from eventfinder.domain import has_explicit_paid_price, normalize_price
 from eventfinder.policy import assess_candidate
 from eventfinder.sources import (
+    MAX_RESPONSE_BYTES,
     PublicPageEventSource,
     RequestLimiter,
     RobotsPolicy,
+    SearchEventSource,
     SourceFetchError,
+    _label_time,
+    _request_redirect_checked,
     make_source,
     parse_event_page,
 )
@@ -51,6 +55,49 @@ def test_timezone_less_source_time_defaults_to_ist_then_stores_utc():
     html = """<script type='application/ld+json'>{"@type":"Event","name":"AI meetup","startDate":"2026-10-10T18:30:00","location":{"name":"Bengaluru"}}</script>"""
     event = parse_event_page(html, "https://example.test/event", "fixture")[0]
     assert event.starts_at.isoformat() == "2026-10-10T13:00:00+00:00"
+
+
+def test_global_source_timezone_interprets_naive_time_in_its_own_zone_not_ist():
+    html = """<script type='application/ld+json'>{"@type":"Event","name":"AWS re:Invent session","startDate":"2026-10-10T18:30:00"}</script>"""
+    event = parse_event_page(
+        html,
+        "https://aws.example.test/event",
+        "aws_events",
+        tz="America/Los_Angeles",
+    )[0]
+    # Same naive local wall-clock time as the IST-default fixture above, but a
+    # source configured for America/Los_Angeles must not be treated as IST.
+    assert event.starts_at.isoformat() == "2026-10-11T01:30:00+00:00"
+
+
+def test_explicit_offset_is_never_overridden_by_source_timezone():
+    html = """<script type='application/ld+json'>{"@type":"Event","name":"AWS re:Invent session","startDate":"2026-10-10T18:30:00+05:30"}</script>"""
+    event = parse_event_page(
+        html,
+        "https://aws.example.test/event",
+        "aws_events",
+        tz="America/Los_Angeles",
+    )[0]
+    assert event.starts_at.isoformat() == "2026-10-10T13:00:00+00:00"
+
+
+def test_label_time_dayfirst_toggle_changes_ambiguous_numeric_date_parsing():
+    dayfirst = _label_time("03/04/2026")
+    monthfirst = _label_time("03/04/2026", dayfirst=False)
+    assert dayfirst.isoformat() == "2026-04-02T18:30:00+00:00"
+    assert monthfirst.isoformat() == "2026-03-03T18:30:00+00:00"
+    assert dayfirst != monthfirst
+
+
+@pytest.mark.parametrize("garbage", ["Coming soon 2026", "TBD"])
+def test_label_time_fails_closed_on_garbage_without_a_real_month_or_day(garbage):
+    assert _label_time(garbage) is None
+
+
+def test_garbage_date_never_fabricates_a_starts_at_on_a_real_candidate():
+    html = """<script type='application/ld+json'>{"@type":"Event","name":"AI Meetup TBD","startDate":"Coming soon 2026"}</script>"""
+    event = parse_event_page(html, "https://example.test/event", "fixture")[0]
+    assert event.starts_at is None
 
 
 @pytest.mark.parametrize(
@@ -200,7 +247,7 @@ async def test_public_page_adapter_respects_robots_and_parses():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         source = PublicPageEventSource(
-            SourceDefinition(name="fixture", adapter="public_page", url="https://example.test/events"),
+            SourceDefinition(name="fixture", adapter="public_page", url="https://example.test/events", rate_limit_seconds=0),
             client,
             RobotsPolicy(client, _safety()),
             _safety(),
@@ -219,7 +266,7 @@ async def test_rate_limit_marks_source_unhealthy_without_retrying():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         source = make_source(
-            SourceDefinition(name="fixture", adapter="public_page", url="https://example.test/events"),
+            SourceDefinition(name="fixture", adapter="public_page", url="https://example.test/events", rate_limit_seconds=0),
             client,
             safety=_safety(),
         )
@@ -339,6 +386,7 @@ async def test_search_results_are_hydrated_before_becoming_candidates(monkeypatc
                 query="technical events",
                 platform="eventbrite",
                 allowed_domains=["events.example.test"],
+                rate_limit_seconds=0,
             ),
             client,
             RobotsPolicy(client, _safety()),
@@ -393,6 +441,7 @@ async def test_bounded_listing_pagination_only_fetches_configured_pages():
                 url="https://events.example.test/listing",
                 max_pages=2,
                 pagination_param="page",
+                rate_limit_seconds=0,
             ),
             client,
             RobotsPolicy(client, _safety()),
@@ -439,7 +488,10 @@ async def test_per_origin_rate_limit_applies_to_each_paginated_request():
             RequestLimiter(sleeper=sleep, clock=lambda: elapsed[0]),
         )
         await source.fetch()
-    assert delays == [3]
+    # The cold-cache robots.txt fetch now shares the same per-origin cadence
+    # (it is never a free first hit), so it consumes the origin's initial
+    # zero-delay slot; page 1 and page 2 then each wait the full 3s behind it.
+    assert delays == [3, 3]
 
 
 @pytest.mark.asyncio
@@ -741,3 +793,309 @@ async def test_redirect_hop_and_outbound_urls_cannot_target_private_networks():
     for value in ("javascript:alert(1)", "data:text/html,hi", "http://localhost/x", "https://u:p@example.test/x"):
         with pytest.raises(UnsafeURL):
             validate_url_syntax(value)
+
+
+@pytest.mark.asyncio
+async def test_response_over_max_bytes_is_rejected_before_it_reaches_parsing():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="x" * 5000)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SourceFetchError, match="response exceeded max size"):
+            await _request_redirect_checked(
+                client, "https://events.example.test/big", _safety(), max_bytes=1000
+            )
+
+
+@pytest.mark.asyncio
+async def test_response_under_max_bytes_is_read_and_decoded_normally():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="a small page body")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await _request_redirect_checked(
+            client, "https://events.example.test/small", _safety(), max_bytes=1000
+        )
+    assert response.text == "a small page body"
+    assert response.status_code == 200
+    assert str(response.url) == "https://events.example.test/small"
+
+
+@pytest.mark.asyncio
+async def test_default_max_response_bytes_cap_rejects_an_oversized_listing_page():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        return httpx.Response(200, text="y" * (MAX_RESPONSE_BYTES + 1))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(name="fixture", adapter="public_page", url="https://example.test/events", rate_limit_seconds=0),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+        )
+        with pytest.raises(SourceFetchError, match="response exceeded max size"):
+            await source.fetch()
+
+
+@pytest.mark.asyncio
+async def test_robots_failure_is_negatively_cached_and_not_immediately_refetched():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        policy = RobotsPolicy(client, _safety())
+        assert not await policy.allows("https://events.example.test/a")
+        assert not await policy.allows("https://events.example.test/b")
+    # The failed robots.txt fetch is cached (fail-closed) so a second path
+    # check within the negative TTL never re-hammers the struggling origin.
+    assert calls == ["/robots.txt"]
+
+
+@pytest.mark.asyncio
+async def test_robots_fetch_times_out_and_still_fails_closed():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("robots.txt timed out")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        policy = RobotsPolicy(client, _safety())
+        assert not await policy.allows("https://events.example.test/a")
+
+
+@pytest.mark.asyncio
+async def test_robots_fetch_is_routed_through_the_source_rate_limiter():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="User-agent: *\nAllow: /")
+
+    waits: list[tuple[str, float]] = []
+
+    class _RecordingLimiter(RequestLimiter):
+        async def wait(self, url: str, seconds: float) -> None:
+            waits.append((url, seconds))
+            await super().wait(url, seconds)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        policy = RobotsPolicy(client, _safety())
+        limiter = _RecordingLimiter(sleeper=lambda _delay: asyncio.sleep(0))
+        await policy.allows("https://events.example.test/a", limiter=limiter, rate_limit_seconds=2)
+    assert waits == [("https://events.example.test/robots.txt", 2)]
+
+
+@pytest.mark.asyncio
+async def test_robots_crawl_delay_increases_the_limiter_wait_beyond_configured_cadence():
+    fixture = Path("tests/fixtures/platform_event.html").read_text(encoding="utf-8")
+    elapsed = [0.0]
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+        elapsed[0] += delay
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\nCrawl-delay: 5")
+        return httpx.Response(200, text=fixture)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(
+                name="fixture",
+                adapter="public_page",
+                platform="official",
+                url="https://events.example.test/listing",
+                max_pages=2,
+                pagination_param="page",
+                rate_limit_seconds=1,
+            ),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+            RequestLimiter(sleeper=sleep, clock=lambda: elapsed[0]),
+        )
+        await source.fetch()
+    # The configured cadence (1s) is below the origin's declared Crawl-delay
+    # (5s); once robots.txt has been loaded, every subsequent same-origin
+    # wait must honor the larger crawl-delay floor, not the smaller cadence.
+    assert delays == [1, 5]
+
+
+class _FakeSearchSettings:
+    def __init__(
+        self,
+        *,
+        serper_api_key: str | None = None,
+        brave_search_api_key: str | None = None,
+        tavily_api_key: str | None = None,
+        exa_api_key: str | None = None,
+    ):
+        self.serper_api_key = serper_api_key
+        self.brave_search_api_key = brave_search_api_key
+        self.tavily_api_key = tavily_api_key
+        self.exa_api_key = exa_api_key
+
+
+def _search_source(client: httpx.AsyncClient) -> SearchEventSource:
+    return SearchEventSource(
+        SourceDefinition(
+            name="search",
+            adapter="search",
+            query="technical events",
+            allowed_domains=["events.example.test"],
+        ),
+        client,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ddgs_failure_falls_back_to_serper_success_shape(monkeypatch):
+    monkeypatch.setattr(
+        "eventfinder.sources.get_settings",
+        lambda: _FakeSearchSettings(serper_api_key="key"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "google.serper.dev"
+        assert request.headers["x-api-key"] == "key"
+        return httpx.Response(200, json={"organic": [{"link": "https://events.example.test/a"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        results = await _search_source(client)._fallback_results("query", RuntimeError("ddgs down"))
+    assert results == [{"href": "https://events.example.test/a"}]
+
+
+@pytest.mark.asyncio
+async def test_ddgs_failure_falls_back_to_brave_success_shape(monkeypatch):
+    monkeypatch.setattr(
+        "eventfinder.sources.get_settings",
+        lambda: _FakeSearchSettings(brave_search_api_key="key"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.search.brave.com"
+        return httpx.Response(200, json={"web": {"results": [{"url": "https://events.example.test/b"}]}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        results = await _search_source(client)._fallback_results("query", RuntimeError("ddgs down"))
+    assert results == [{"href": "https://events.example.test/b"}]
+
+
+@pytest.mark.asyncio
+async def test_ddgs_failure_falls_back_to_tavily_success_shape(monkeypatch):
+    monkeypatch.setattr(
+        "eventfinder.sources.get_settings",
+        lambda: _FakeSearchSettings(tavily_api_key="key"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.tavily.com"
+        return httpx.Response(200, json={"results": [{"url": "https://events.example.test/c"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        results = await _search_source(client)._fallback_results("query", RuntimeError("ddgs down"))
+    assert results == [{"href": "https://events.example.test/c"}]
+
+
+@pytest.mark.asyncio
+async def test_ddgs_failure_falls_back_to_exa_success_shape(monkeypatch):
+    monkeypatch.setattr(
+        "eventfinder.sources.get_settings",
+        lambda: _FakeSearchSettings(exa_api_key="key"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.exa.ai"
+        return httpx.Response(200, json={"results": [{"url": "https://events.example.test/d"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        results = await _search_source(client)._fallback_results("query", RuntimeError("ddgs down"))
+    assert results == [{"href": "https://events.example.test/d"}]
+
+
+@pytest.mark.asyncio
+async def test_serper_4xx_with_no_further_providers_raises_source_fetch_error(monkeypatch):
+    monkeypatch.setattr(
+        "eventfinder.sources.get_settings",
+        lambda: _FakeSearchSettings(serper_api_key="key"),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(400))
+    ) as client:
+        with pytest.raises(SourceFetchError, match="search unavailable"):
+            await _search_source(client)._fallback_results("query", RuntimeError("ddgs down"))
+
+
+@pytest.mark.asyncio
+async def test_brave_timeout_with_no_further_providers_raises_source_fetch_error(monkeypatch):
+    monkeypatch.setattr(
+        "eventfinder.sources.get_settings",
+        lambda: _FakeSearchSettings(brave_search_api_key="key"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("brave timed out")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SourceFetchError, match="search unavailable"):
+            await _search_source(client)._fallback_results("query", RuntimeError("ddgs down"))
+
+
+@pytest.mark.asyncio
+async def test_all_search_fallback_providers_failing_raises_source_fetch_error(monkeypatch):
+    monkeypatch.setattr(
+        "eventfinder.sources.get_settings",
+        lambda: _FakeSearchSettings(
+            serper_api_key="s", brave_search_api_key="b", tavily_api_key="t", exa_api_key="e"
+        ),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500))
+    ) as client:
+        with pytest.raises(SourceFetchError, match="search unavailable"):
+            await _search_source(client)._fallback_results("query", RuntimeError("ddgs down"))
+
+
+@pytest.mark.asyncio
+async def test_search_fetch_hydrates_serper_fallback_results_end_to_end(monkeypatch):
+    fixture = Path("tests/fixtures/platform_event.html").read_text(encoding="utf-8")
+
+    class _RaisingSearch:
+        def text(self, *_args, **_kwargs):
+            raise RuntimeError("ddgs unavailable")
+
+    monkeypatch.setattr("eventfinder.sources.DDGS", _RaisingSearch)
+    monkeypatch.setattr(
+        "eventfinder.sources.get_settings",
+        lambda: _FakeSearchSettings(serper_api_key="key"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "google.serper.dev":
+            return httpx.Response(
+                200, json={"organic": [{"link": "https://events.example.test/platform-fixture"}]}
+            )
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        return httpx.Response(200, text=fixture)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = make_source(
+            SourceDefinition(
+                name="search",
+                adapter="search",
+                query="technical events",
+                platform="eventbrite",
+                allowed_domains=["events.example.test"],
+                rate_limit_seconds=0,
+            ),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+        )
+        result = await source.fetch()
+    assert result.candidates[0].canonical_url == "https://events.example.test/platform-fixture"

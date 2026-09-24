@@ -34,7 +34,17 @@ from eventfinder.urls import UnsafeURL, URLSafety, validate_url_syntax
 
 USER_AGENT = "EventFinder/0.1 (+local read-only technical event discovery)"
 ROBOTS_TTL = timedelta(hours=6)
+# A failed/unreachable robots.txt still fails closed (disallow), but caching
+# that failure for a shorter, distinct TTL stops every subsequent page fetch
+# from re-hammering an already-struggling or misconfigured origin.
+NEGATIVE_ROBOTS_TTL = timedelta(minutes=15)
 MAX_REDIRECTS = 5
+# Bound the terminal (non-redirect) response body read from the network so a
+# malicious or misbehaving origin cannot exhaust memory via an oversized or
+# decompression-bomb response. Applied to the decoded byte stream as it is
+# read, which also caps inflated (gzip/deflate/br) payload sizes.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ROBOTS_BYTES = 512 * 1024
 PLATFORM_CARD_SELECTORS = {
     "luma": "[data-event], [class*='event-card'], a[href*='/event/']",
     "meetup": "[data-event-id], [data-testid*='event'], [class*='event-card']",
@@ -161,13 +171,22 @@ class RobotsPolicy:
         client: httpx.AsyncClient,
         safety: URLSafety | None = None,
         ttl: timedelta = ROBOTS_TTL,
+        negative_ttl: timedelta = NEGATIVE_ROBOTS_TTL,
     ):
         self.client = client
         self.safety = safety or URLSafety()
         self.ttl = ttl
-        self._cache: dict[str, tuple[RobotFileParser, datetime]] = {}
+        self.negative_ttl = negative_ttl
+        # (parser or None on failure, cache expiry, discovered crawl-delay seconds)
+        self._cache: dict[str, tuple[RobotFileParser | None, datetime, float]] = {}
 
-    async def allows(self, url: str, allowed_domains: set[str] | None = None) -> bool:
+    async def allows(
+        self,
+        url: str,
+        allowed_domains: set[str] | None = None,
+        limiter: RequestLimiter | None = None,
+        rate_limit_seconds: float = 0,
+    ) -> bool:
         safe_url = await self.safety.validate(url)
         if allowed_domains is not None and not _allowed_destination(safe_url, allowed_domains):
             return False
@@ -175,33 +194,89 @@ class RobotsPolicy:
         origin = f"{parsed.scheme}://{parsed.netloc}"
         cached = self._cache.get(origin)
         if cached is None or cached[1] <= datetime.now(UTC):
-            parser = await self._load(origin, allowed_domains)
-            if parser is None:
-                return False
-            self._cache[origin] = (parser, datetime.now(UTC) + self.ttl)
-        return self._cache[origin][0].can_fetch(USER_AGENT, safe_url)
+            parser, crawl_delay = await self._load(
+                origin, allowed_domains, limiter, rate_limit_seconds
+            )
+            ttl = self.ttl if parser is not None else self.negative_ttl
+            self._cache[origin] = (parser, datetime.now(UTC) + ttl, crawl_delay)
+        parser = self._cache[origin][0]
+        if parser is None:
+            return False
+        return parser.can_fetch(USER_AGENT, safe_url)
+
+    def crawl_delay(self, url: str) -> float:
+        """Return the origin's declared Crawl-delay, or 0 if unknown/unset."""
+
+        parsed = urlsplit(url)
+        cached = self._cache.get(f"{parsed.scheme}://{parsed.netloc}")
+        return cached[2] if cached else 0.0
 
     async def _load(
-        self, origin: str, allowed_domains: set[str] | None = None
-    ) -> RobotFileParser | None:
+        self,
+        origin: str,
+        allowed_domains: set[str] | None,
+        limiter: RequestLimiter | None,
+        rate_limit_seconds: float,
+    ) -> tuple[RobotFileParser | None, float]:
         try:
+            # The robots.txt fetch itself must observe the same per-origin
+            # cadence as every other request; it is never a free first hit.
+            if limiter:
+                await limiter.wait(f"{origin}/robots.txt", rate_limit_seconds)
             response = await _request_redirect_checked(
                 self.client,
                 f"{origin}/robots.txt",
                 self.safety,
                 allowed_domains=allowed_domains,
+                max_bytes=MAX_ROBOTS_BYTES,
             )
         except httpx.HTTPStatusError as error:
             if error.response.status_code != 404:
-                return None
+                return None, 0.0
             parser = RobotFileParser()
             parser.parse(["User-agent: *", "Allow: /"])
-            return parser
+            return parser, 0.0
         except (httpx.HTTPError, SourceFetchError, UnsafeURL):
-            return None
+            return None, 0.0
         parser = RobotFileParser()
         parser.parse(response.text.splitlines())
-        return parser
+        return parser, float(parser.crawl_delay(USER_AGENT) or 0.0)
+
+
+class _CappedResponse:
+    """Lightweight terminal-response facade: exactly the attributes downstream
+    parsing needs, decoupled from the transport response's streamed/consumed
+    lifecycle once the size-capped body has been read."""
+
+    __slots__ = ("status_code", "headers", "url", "text")
+
+    def __init__(self, status_code: int, headers: httpx.Headers, url: httpx.URL, text: str) -> None:
+        self.status_code = status_code
+        self.headers = headers
+        self.url = url
+        self.text = text
+
+
+async def _read_capped_text(response: httpx.Response, max_bytes: int) -> str:
+    """Stream a terminal response body up to ``max_bytes`` decoded bytes,
+    guarding against decompression bombs and unbounded downloads."""
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            await response.aclose()
+            raise SourceFetchError("response exceeded max size")
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    encoding = response.charset_encoding
+    if encoding:
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            pass
+    return data.decode("utf-8", errors="replace")
 
 
 @retry(
@@ -218,29 +293,44 @@ async def _request_redirect_checked(
     allowed_domains: set[str] | None = None,
     limiter: RequestLimiter | None = None,
     rate_limit_seconds: float = 0,
-) -> httpx.Response:
+    max_bytes: int = MAX_RESPONSE_BYTES,
+) -> _CappedResponse:
     current = url
     for _ in range(MAX_REDIRECTS + 1):
         current = await safety.validate(current)
         if allowed_domains is not None and not _allowed_destination(current, allowed_domains):
             raise SourceFetchError("destination is outside this source's allowed domains")
-        if robots_policy and not await robots_policy.allows(current, allowed_domains):
+        if robots_policy and not await robots_policy.allows(
+            current, allowed_domains, limiter, rate_limit_seconds
+        ):
             raise SourceFetchError("robots policy disallows this URL")
         if limiter:
-            await limiter.wait(current, rate_limit_seconds)
-        response = await client.get(current, headers={"User-Agent": USER_AGENT}, follow_redirects=False)
-        if response.status_code == 429:
-            raise SourceFetchError("rate limited; source paused", status_code=429)
-        if response.status_code in {401, 403}:
-            raise SourceFetchError("source denied public access", status_code=response.status_code)
-        if response.is_redirect:
-            location = response.headers.get("location")
-            if not location:
-                raise SourceFetchError("redirect missing location", status_code=response.status_code)
-            current = urljoin(current, location)
-            continue
-        response.raise_for_status()
-        return response
+            # A declared Crawl-delay is a floor, never a ceiling: it can only
+            # slow this source down further than its configured cadence.
+            effective_rate_limit = (
+                max(rate_limit_seconds, robots_policy.crawl_delay(current))
+                if robots_policy
+                else rate_limit_seconds
+            )
+            await limiter.wait(current, effective_rate_limit)
+        request = client.build_request("GET", current, headers={"User-Agent": USER_AGENT})
+        response = await client.send(request, stream=True, follow_redirects=False)
+        try:
+            if response.status_code == 429:
+                raise SourceFetchError("rate limited; source paused", status_code=429)
+            if response.status_code in {401, 403}:
+                raise SourceFetchError("source denied public access", status_code=response.status_code)
+            if response.is_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise SourceFetchError("redirect missing location", status_code=response.status_code)
+                current = urljoin(current, location)
+                continue
+            response.raise_for_status()
+            text = await _read_capped_text(response, max_bytes)
+        finally:
+            await response.aclose()
+        return _CappedResponse(response.status_code, response.headers, response.url, text)
     raise SourceFetchError("too many redirects")
 
 
@@ -348,6 +438,8 @@ class PublicPageEventSource(EventSource):
                 self.definition.name,
                 observed_at,
                 self.definition.platform,
+                self.definition.source_timezone,
+                self.definition.date_dayfirst,
             )
             candidates.extend(await self.validated_candidates(parsed))
             for detail_url in _configured_detail_urls(
@@ -413,6 +505,8 @@ class PublicPageEventSource(EventSource):
                 self.definition.name,
                 observed_at,
                 self.definition.platform,
+                self.definition.source_timezone,
+                self.definition.date_dayfirst,
             )
             candidates.extend(await self.validated_candidates(parsed))
             evidence.append(
@@ -486,6 +580,8 @@ class SearchEventSource(EventSource):
                 self.definition.name,
                 observed_at,
                 self.definition.platform,
+                self.definition.source_timezone,
+                self.definition.date_dayfirst,
             )
             for candidate in await self.validated_candidates(parsed):
                 if candidate.canonical_url not in seen:
@@ -573,7 +669,7 @@ def _text(value: Any) -> str | None:
     return None
 
 
-def _parse_time(value: Any) -> datetime | None:
+def _parse_time(value: Any, tz: str = "Asia/Kolkata") -> datetime | None:
     text = _text(value)
     if not text:
         return None
@@ -582,7 +678,7 @@ def _parse_time(value: Any) -> datetime | None:
     except (TypeError, ValueError, OverflowError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        parsed = parsed.replace(tzinfo=ZoneInfo(tz))
     return parsed.astimezone(UTC)
 
 
@@ -644,7 +740,9 @@ def _registration_state(text: str) -> RegistrationState:
     )
 
 
-def _offer_values(offers: Any) -> tuple[str | None, str | None, str | None, datetime | None]:
+def _offer_values(
+    offers: Any, tz: str = "Asia/Kolkata"
+) -> tuple[str | None, str | None, str | None, datetime | None]:
     prices: list[str] = []
     registration_url: str | None = None
     availability: str | None = None
@@ -662,7 +760,7 @@ def _offer_values(offers: Any) -> tuple[str | None, str | None, str | None, date
             prices.append(f"{currency or ''} {price}".strip())
         registration_url = registration_url or _text(offer.get("url") or offer.get("checkoutUrl"))
         availability = availability or _text(offer.get("availability"))
-        valid_from = valid_from or _parse_time(offer.get("validFrom"))
+        valid_from = valid_from or _parse_time(offer.get("validFrom"), tz)
     # A multi-tier offer may include free admission and a paid pass/workshop.
     # Retain every explicitly displayed price so policy can reject any paid tier.
     return "; ".join(dict.fromkeys(prices)) or None, registration_url, availability, valid_from
@@ -706,7 +804,14 @@ def _local_datetime(node: dict[str, Any], prefix: str) -> str | None:
     return f"{date}T{time}" if date and time else date
 
 
-def _candidate_from_mapping(node: dict[str, Any], page_url: str, source_name: str, observed_at: datetime, parser_name: str) -> EventCandidate | None:
+def _candidate_from_mapping(
+    node: dict[str, Any],
+    page_url: str,
+    source_name: str,
+    observed_at: datetime,
+    parser_name: str,
+    tz: str = "Asia/Kolkata",
+) -> EventCandidate | None:
     title = _text(node.get("name") or node.get("title") or node.get("eventName"))
     start = _parse_time(
         node.get("startDate")
@@ -716,7 +821,8 @@ def _candidate_from_mapping(node: dict[str, Any], page_url: str, source_name: st
         or node.get("start_at")
         or node.get("startAt")
         or node.get("start")
-        or _local_datetime(node, "local")
+        or _local_datetime(node, "local"),
+        tz,
     )
     kind = node.get("@type") or node.get("type") or ""
     if not title or not ("event" in str(kind).casefold() or start or node.get("registrationDeadline")):
@@ -727,7 +833,7 @@ def _candidate_from_mapping(node: dict[str, Any], page_url: str, source_name: st
         node.get("location") or node.get("venue") or node.get("geo_address_info") or {"city": node.get("city")}
     )
     price, offer_url, offer_availability, offer_valid_from = _offer_values(
-        node.get("offers") or node.get("ticket") or node.get("pricing") or node.get("tickets")
+        node.get("offers") or node.get("ticket") or node.get("pricing") or node.get("tickets"), tz
     )
     price = price or normalize_price(_first_present(node, "price", "fee", "price_text"))
     registration_url = _text(node.get("registrationUrl") or node.get("registration_url") or node.get("registrationLink") or node.get("registerUrl") or node.get("applyUrl") or node.get("actionUrl")) or offer_url or event_url
@@ -755,19 +861,26 @@ def _candidate_from_mapping(node: dict[str, Any], page_url: str, source_name: st
     return EventCandidate(
         title=title, canonical_url=urljoin(page_url, event_url), source_url=page_url, source_name=source_name,
         organizer=_text(node.get("organizer") or node.get("host") or node.get("organization") or node.get("organizerName")), description=description,
-        starts_at=start, ends_at=_parse_time(node.get("endDate") or node.get("end_time") or node.get("endTime") or node.get("ends_at") or node.get("end_at") or node.get("endAt") or _local_datetime(node, "local_end")),
+        starts_at=start, ends_at=_parse_time(node.get("endDate") or node.get("end_time") or node.get("endTime") or node.get("ends_at") or node.get("end_at") or node.get("endAt") or _local_datetime(node, "local_end"), tz),
         venue=venue, city=city, country=country, format=_format(node.get("eventAttendanceMode") or node.get("format") or node.get("event_format") or node.get("mode"), venue, node.get("isOnline") or node.get("is_online")),
         event_type=_event_type(title, description), registration_state=(
             schema_state if schema_state != RegistrationState.UNKNOWN else parsed_state
         ), registration_url=urljoin(page_url, registration_url),
-        registration_deadline=_parse_time(node.get("registrationDeadline") or node.get("registration_deadline") or node.get("registration_closes_at") or node.get("applicationDeadline") or node.get("deadline")),
-        registration_opened_at=_parse_time(node.get("registrationOpenedAt") or node.get("registration_opened_at") or node.get("registration_opened") or node.get("registrationOpenDate") or node.get("registrationDate")) or offer_valid_from,
+        registration_deadline=_parse_time(node.get("registrationDeadline") or node.get("registration_deadline") or node.get("registration_closes_at") or node.get("applicationDeadline") or node.get("deadline"), tz),
+        registration_opened_at=_parse_time(node.get("registrationOpenedAt") or node.get("registration_opened_at") or node.get("registration_opened") or node.get("registrationOpenDate") or node.get("registrationDate"), tz) or offer_valid_from,
         price_text=price, is_explicitly_paid=_is_paid(price), eligibility_text=eligibility, speakers=speakers,
         topics=[topic for topic in _as_list(node.get("topics") or node.get("tags") or node.get("categories")) if isinstance(topic, str)], evidence=evidence,
     )
 
 
-def _html_card_candidates(soup: BeautifulSoup, page_url: str, source_name: str, observed_at: datetime, platform: str | None) -> list[EventCandidate]:
+def _html_card_candidates(
+    soup: BeautifulSoup,
+    page_url: str,
+    source_name: str,
+    observed_at: datetime,
+    platform: str | None,
+    tz: str = "Asia/Kolkata",
+) -> list[EventCandidate]:
     selector = PLATFORM_CARD_SELECTORS.get(platform or "", "[data-event], [class*='event-card'], article")
     candidates: list[EventCandidate] = []
     for card in soup.select(selector):
@@ -786,7 +899,7 @@ def _html_card_candidates(soup: BeautifulSoup, page_url: str, source_name: str, 
             "registrationOpenedAt": attrs.get("data-registration-opened-at") or attrs.get("data-registration-open-date"),
             "eligibility": attrs.get("data-eligibility"), "location": {"name": attrs.get("data-venue"), "city": attrs.get("data-city")}, "format": attrs.get("data-format"),
         }
-        candidate = _candidate_from_mapping(mapping, page_url, source_name, observed_at, f"{platform or 'generic'}:html")
+        candidate = _candidate_from_mapping(mapping, page_url, source_name, observed_at, f"{platform or 'generic'}:html", tz)
         if candidate:
             candidates.append(candidate)
     return candidates
@@ -821,17 +934,37 @@ def _label_value(soup: BeautifulSoup, labels: tuple[str, ...]) -> str | None:
     return None
 
 
-def _label_time(value: str | None) -> datetime | None:
-    """Parse an explicitly labelled full date only; never supply a missing year."""
+_MONTH_NAME_PATTERN = re.compile(
+    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?"
+    r"|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
+    re.I,
+)
+# A day/month numeric token, e.g. the "10-10" in "2026-10-10" or "05/03" in
+# "05/03/2026". This is deliberately loose: it only gates whether the text
+# carries a real date beyond a bare year, never the value that gets parsed.
+_NUMERIC_DATE_TOKEN_PATTERN = re.compile(r"\d{1,2}[/-]\d{1,2}")
+# An explicit year-first numeric date (e.g. "2026-10-11") is already
+# unambiguous: the two-digit fields that follow are month-then-day. The
+# source's dayfirst preference must only disambiguate genuinely ambiguous,
+# year-last numeric dates (e.g. "03/04/2026"); dateutil's dayfirst otherwise
+# also reorders an already-unambiguous year-first date's month/day pair.
+_YEAR_FIRST_NUMERIC_DATE_PATTERN = re.compile(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b")
+
+
+def _label_time(value: str | None, tz: str = "Asia/Kolkata", dayfirst: bool = True) -> datetime | None:
+    """Parse an explicitly labelled full date only; never supply a missing month/day/year."""
 
     if not value or not re.search(r"\b20\d{2}\b", value):
         return None
+    if not (_MONTH_NAME_PATTERN.search(value) or _NUMERIC_DATE_TOKEN_PATTERN.search(value)):
+        return None
+    effective_dayfirst = False if _YEAR_FIRST_NUMERIC_DATE_PATTERN.search(value) else dayfirst
     try:
-        parsed = date_parser.parse(value, fuzzy=True)
+        parsed = date_parser.parse(value, fuzzy=True, dayfirst=effective_dayfirst)
     except (TypeError, ValueError, OverflowError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        parsed = parsed.replace(tzinfo=ZoneInfo(tz))
     return parsed.astimezone(UTC)
 
 
@@ -841,6 +974,8 @@ def _semantic_candidate(
     source_name: str,
     observed_at: datetime,
     platform: str | None,
+    tz: str = "Asia/Kolkata",
+    dayfirst: bool = True,
 ) -> EventCandidate | None:
     """Platform-detail fallback for public pages whose facts are semantic labels."""
 
@@ -850,13 +985,13 @@ def _semantic_candidate(
         soup,
         ("starts", "runs from", "happening", "date and time", "date & time", "date"),
     )
-    starts_at = _label_time(starts_text)
+    starts_at = _label_time(starts_text, tz, dayfirst)
     if starts_at is None:
         time_node = soup.select_one("time[datetime]")
-        starts_at = _parse_time(time_node.get("datetime") if time_node else None)
+        starts_at = _parse_time(time_node.get("datetime") if time_node else None, tz)
     if not title or not starts_at:
         return None
-    ends_at = _label_time(_label_value(soup, ("ends", "ends at", "runs until")))
+    ends_at = _label_time(_label_value(soup, ("ends", "ends at", "runs until")), tz, dayfirst)
     venue = _label_value(soup, ("venue", "location", "address", "where"))
     city = "Bengaluru" if venue and re.search(r"\b(?:bengaluru|bangalore|blr)\b", venue, re.I) else None
     organizer = _label_value(soup, ("presented by", "hosted by", "host", "organizer"))
@@ -867,7 +1002,9 @@ def _semantic_candidate(
     page_text = soup.get_text(" ", strip=True)
     registration_state = _registration_state(registration_state_text or page_text)
     deadline = _label_time(
-        _label_value(soup, ("registration deadline", "apply by", "sales end", "applications close"))
+        _label_value(soup, ("registration deadline", "apply by", "sales end", "applications close")),
+        tz,
+        dayfirst,
     )
     eligibility = _label_value(soup, ("eligibility", "who can participate", "who can apply"))
     price = _label_value(soup, ("fee", "cost", "price", "entry fee"))
@@ -908,7 +1045,9 @@ def _semantic_candidate(
             _label_value(
                 soup,
                 ("registration opened", "registration open date", "applications opened"),
-            )
+            ),
+            tz,
+            dayfirst,
         ),
         price_text=price,
         is_explicitly_paid=_is_paid(price),
@@ -918,7 +1057,15 @@ def _semantic_candidate(
     )
 
 
-def parse_event_page(html: str, page_url: str, source_name: str, observed_at: datetime | None = None, platform: str | None = None) -> list[EventCandidate]:
+def parse_event_page(
+    html: str,
+    page_url: str,
+    source_name: str,
+    observed_at: datetime | None = None,
+    platform: str | None = None,
+    tz: str = "Asia/Kolkata",
+    dayfirst: bool = True,
+) -> list[EventCandidate]:
     """Extract JSON-LD, embedded public JSON, and platform card markup without invented facts."""
     observed_at = observed_at or datetime.now(UTC)
     soup = BeautifulSoup(html, "html.parser")
@@ -930,11 +1077,11 @@ def parse_event_page(html: str, page_url: str, source_name: str, observed_at: da
             continue
         parser_name = "json_ld" if script.get("type") == "application/ld+json" else "embedded_json"
         for node in _json_nodes(payload):
-            candidate = _candidate_from_mapping(node, page_url, source_name, observed_at, parser_name)
+            candidate = _candidate_from_mapping(node, page_url, source_name, observed_at, parser_name, tz)
             if candidate:
                 candidates.append(candidate)
-    candidates.extend(_html_card_candidates(soup, page_url, source_name, observed_at, platform))
-    if semantic := _semantic_candidate(soup, page_url, source_name, observed_at, platform):
+    candidates.extend(_html_card_candidates(soup, page_url, source_name, observed_at, platform, tz))
+    if semantic := _semantic_candidate(soup, page_url, source_name, observed_at, platform, tz, dayfirst):
         candidates.append(semantic)
     if candidates:
         return _dedupe_candidates(candidates)

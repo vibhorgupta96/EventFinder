@@ -364,6 +364,64 @@ def test_platform_semantic_label_fixtures_extract_only_evidenced_fields(
 
 
 @pytest.mark.asyncio
+async def test_meetup_detail_ignores_unrelated_online_page_text():
+    html = """<main><h1>Bengaluru Systems Meetup</h1>
+    <dl><dt>Date and time</dt><dd>2026-10-11 10:00 IST</dd>
+    <dt>Format</dt><dd>In person</dd>
+    <dt>Venue</dt><dd>Bengaluru Innovation Center</dd></dl>
+    <p>Browse recordings of our previous online talks.</p></main>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        return httpx.Response(200, text=html)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(
+                name="meetup_fixture",
+                adapter="public_page",
+                platform="meetup",
+                url="https://events.example.test/event",
+                allowed_domains=["events.example.test"],
+                rate_limit_seconds=0,
+            ),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+        )
+        result = await source.fetch()
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].format.value == "in_person"
+
+
+def test_explicit_json_ld_offline_mode_outranks_semantic_format():
+    html = """<script type='application/ld+json'>
+    {"@type":"Event","name":"Bengaluru Systems Meetup",
+    "url":"https://events.example.test/event","startDate":"2026-10-11T10:00:00+05:30",
+    "eventAttendanceMode":"https://schema.org/OfflineEventAttendanceMode",
+    "location":{"name":"Bengaluru Innovation Center"}}
+    </script><main><h1>Bengaluru Systems Meetup</h1>
+    <dl><dt>Date and time</dt><dd>2026-10-11 10:00 IST</dd>
+    <dt>Format</dt><dd>Online</dd></dl></main>"""
+    candidates = parse_event_page(html, "https://events.example.test/event", "fixture")
+
+    assert len(candidates) == 1
+    assert candidates[0].format.value == "in_person"
+
+
+def test_combined_in_person_and_online_label_is_hybrid():
+    html = """<main><h1>Bengaluru Systems Meetup</h1>
+    <dl><dt>Date and time</dt><dd>2026-10-11 10:00 IST</dd>
+    <dt>Format</dt><dd>In person and online</dd>
+    <dt>Venue</dt><dd>Bengaluru Innovation Center</dd></dl></main>"""
+
+    candidate = parse_event_page(html, "https://events.example.test/event", "fixture")[0]
+    assert candidate.format.value == "hybrid"
+
+
+@pytest.mark.asyncio
 async def test_search_results_are_hydrated_before_becoming_candidates(monkeypatch):
     fixture = Path("tests/fixtures/platform_event.html").read_text(encoding="utf-8")
 
@@ -536,6 +594,53 @@ async def test_configured_detail_hydration_is_bounded_and_deduplicated():
         "detail",
         "detail",
     ]
+
+
+@pytest.mark.asyncio
+async def test_detail_json_ld_attendance_corrects_listing_json_ld():
+    listing = """<script type='application/ld+json'>
+    {"@type":"Event","name":"Bengaluru Systems Meetup",
+    "url":"https://events.example.test/events/a",
+    "startDate":"2026-10-11T10:00:00+05:30",
+    "eventAttendanceMode":"https://schema.org/OfflineEventAttendanceMode"}
+    </script><a class='event-detail' href='/events/a'>Event details</a>"""
+    detail = """<script type='application/ld+json'>
+    {"@type":"Event","name":"Bengaluru Systems Meetup",
+    "url":"https://events.example.test/events/a",
+    "startDate":"2026-10-11T10:00:00+05:30",
+    "eventAttendanceMode":"https://schema.org/OnlineEventAttendanceMode"}
+    </script><main><h1>Bengaluru Systems Meetup</h1>
+    <dl><dt>Date and time</dt><dd>2026-10-11 10:00 IST</dd>
+    <dt>Format</dt><dd>In person</dd></dl></main>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        if request.url.path == "/listing":
+            return httpx.Response(200, text=listing)
+        if request.url.path == "/events/a":
+            return httpx.Response(200, text=detail)
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(
+            SourceDefinition(
+                name="details_fixture",
+                adapter="public_page",
+                url="https://events.example.test/listing",
+                allowed_domains=["events.example.test"],
+                detail_link_selectors=["a.event-detail"],
+                max_detail_pages=1,
+                rate_limit_seconds=0,
+            ),
+            client,
+            RobotsPolicy(client, _safety()),
+            _safety(),
+        )
+        result = await source.fetch()
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].format.value == "online"
 
 
 @pytest.mark.asyncio

@@ -172,6 +172,33 @@ class DigestService:
             by_event.setdefault(event.id, (event, []))[1].append(change)
         return sorted(by_event.values(), key=_event_order)[:limit]
 
+    @staticmethod
+    def _suppress_reverted_formats(
+        session: Session, pairs: list[tuple[EventChange, Event]]
+    ) -> list[tuple[EventChange, Event]]:
+        """Drop pending format flips whose final value is the original value."""
+
+        by_event: dict[int, list[tuple[EventChange, Event]]] = {}
+        for change, event in pairs:
+            if change.change_type == "format":
+                by_event.setdefault(event.id, []).append((change, event))
+        suppressed_ids: set[int] = set()
+        suppressed: list[EventChange] = []
+        for format_pairs in by_event.values():
+            oldest = min(
+                format_pairs,
+                key=lambda pair: (_as_utc(pair[0].observed_at), pair[0].id or 0),
+            )[0]
+            if oldest.old_value != format_pairs[0][1].format:
+                continue
+            for change, _ in format_pairs:
+                suppressed.append(change)
+                if change.id is not None:
+                    suppressed_ids.add(change.id)
+        if suppressed:
+            mark_changes_digested(session, suppressed)
+        return [(change, event) for change, event in pairs if change.id not in suppressed_ids]
+
     def _create_run(self, session: Session, now: datetime, changes: list[EventChange]) -> DigestRun:
         run = DigestRun(digest_date=_digest_date(now), event_change_ids=[c.id for c in changes if c.id])
         session.add(run)
@@ -253,7 +280,7 @@ class DigestService:
                 return {"status": "already_sent", "events": 0, "chunks": 0}
             if current_run and current_run.status == "failed":
                 return {"status": "failed", "events": 0, "chunks": 0}
-            pairs = pending_changes(session)
+            pairs = self._suppress_reverted_formats(session, pending_changes(session))
             grouped = self._group(pairs, self.limit)
             selected = [change for _, changes in grouped for change in changes]
             if not selected:

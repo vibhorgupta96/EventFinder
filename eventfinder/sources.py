@@ -788,10 +788,22 @@ def _is_paid(price: str | None) -> bool:
 
 
 def _format(value: Any, venue: str | None, is_online: Any = None) -> EventFormat:
-    text = " ".join(filter(None, [_text(value) or "", venue or "", str(is_online or "")])).casefold()
-    if "hybrid" in text or "mixed" in text:
+    # An event's explicit attendance mode outranks venue and online flags.
+    # In particular, a venue or unrelated page prose must not turn an
+    # OfflineEventAttendanceMode event into an online one.
+    mode = (_text(value) or "").casefold()
+    in_person = "offline" in mode or "in person" in mode or "in-person" in mode
+    online = "online" in mode or "virtual" in mode
+    if "hybrid" in mode or "mixed" in mode or (in_person and online):
         return EventFormat.HYBRID
-    if "online" in text or "virtual" in text or str(is_online).casefold() == "true":
+    if in_person:
+        return EventFormat.IN_PERSON
+    if online:
+        return EventFormat.ONLINE
+    if str(is_online).casefold() == "true":
+        return EventFormat.ONLINE
+    venue_text = (venue or "").casefold()
+    if "online" in venue_text or "virtual" in venue_text:
         return EventFormat.ONLINE
     return EventFormat.IN_PERSON if venue else EventFormat.UNKNOWN
 
@@ -1036,7 +1048,7 @@ def _semantic_candidate(
         ends_at=ends_at,
         venue=venue,
         city=city,
-        format=_format(format_text, venue, "online" in page_text.casefold()),
+        format=_format(format_text, venue),
         event_type=_event_type(title, page_text),
         registration_state=registration_state,
         registration_url=registration_url,
@@ -1160,6 +1172,24 @@ def _flattened_observations(evidence: SourceEvidence) -> list[dict[str, Any]]:
     ]
 
 
+def _explicit_json_ld_format(candidate: EventCandidate) -> EventFormat | None:
+    """Keep schema attendance evidence ahead of weaker HTML observations."""
+
+    # Flattened observations are chronological within a merged candidate.
+    # A later detail page can correct an earlier listing's schema mode.
+    for observation in reversed(_flattened_observations(candidate.evidence)):
+        facts = observation.get("facts", {})
+        if not isinstance(facts, dict) or facts.get("parser") != "json_ld":
+            continue
+        event = facts.get("event")
+        if not isinstance(event, dict) or not event.get("eventAttendanceMode"):
+            continue
+        event_format = _format(event["eventAttendanceMode"], None)
+        if event_format != EventFormat.UNKNOWN:
+            return event_format
+    return None
+
+
 def _merge_candidates(existing: EventCandidate, candidate: EventCandidate) -> EventCandidate:
     """Merge complementary observations without weakening policy-relevant facts."""
 
@@ -1174,7 +1204,9 @@ def _merge_candidates(existing: EventCandidate, candidate: EventCandidate) -> Ev
     merged.city = candidate.city or existing.city
     merged.country = candidate.country or existing.country
     merged.format = (
-        candidate.format if candidate.format != EventFormat.UNKNOWN else existing.format
+        _explicit_json_ld_format(candidate)
+        or _explicit_json_ld_format(existing)
+        or (candidate.format if candidate.format != EventFormat.UNKNOWN else existing.format)
     )
     merged.event_type = (
         candidate.event_type if candidate.event_type != EventType.UNKNOWN else existing.event_type

@@ -37,6 +37,84 @@ async def test_digest_is_silent_when_no_changes(session):
     assert (await service.send_daily_digest())["status"] == "silent"
 
 
+def _seed_format_changes(session, current_format: str, changes: list[tuple[str, str, str]]):
+    event = Event(
+        canonical_url="https://events.example.test/format-flip",
+        normalized_key="format-flip",
+        title="Bengaluru Systems Meetup",
+        starts_at=datetime.now(UTC) + timedelta(days=8),
+        venue="Bengaluru Innovation Center",
+        format=current_format,
+    )
+    session.add(event)
+    session.flush()
+    rows = [
+        EventChange(
+            event_id=event.id,
+            change_type=kind,
+            old_value=old_value,
+            new_value=new_value,
+            observed_at=datetime(2026, 9, 27, index, tzinfo=UTC),
+        )
+        for index, (kind, old_value, new_value) in enumerate(changes)
+    ]
+    session.add_all(rows)
+    session.commit()
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_reverted_format_only_digest_is_silent_and_clears_pending_changes(session):
+    rows = _seed_format_changes(
+        session,
+        "in_person",
+        [("format", "in_person", "online"), ("format", "online", "in_person")],
+    )
+    sender = Sender()
+    service = DigestService(lambda: session, sender)
+
+    assert (await service.send_daily_digest(now=datetime(2026, 9, 28, 3, tzinfo=UTC)))["status"] == "silent"
+    assert sender.bodies == []
+    assert all(row.digested_at is not None for row in rows)
+    assert (await service.send_daily_digest(now=datetime(2026, 9, 29, 3, tzinfo=UTC)))["status"] == "silent"
+
+
+@pytest.mark.asyncio
+async def test_reverted_format_does_not_hide_real_change(session):
+    rows = _seed_format_changes(
+        session,
+        "in_person",
+        [
+            ("format", "in_person", "online"),
+            ("format", "online", "in_person"),
+            ("schedule", "2026-10-10T04:30:00+00:00", "2026-10-11T04:30:00+00:00"),
+        ],
+    )
+    sender = Sender()
+    service = DigestService(lambda: session, sender)
+
+    result = await service.send_daily_digest(now=datetime(2026, 9, 28, 3, tzinfo=UTC))
+    assert result["status"] == "sent"
+    assert len(sender.bodies) == 1
+    assert "Updated: schedule" in sender.bodies[0]
+    assert "Updated: format" not in sender.bodies[0]
+    run = session.exec(select(DigestRun)).one()
+    assert run.event_change_ids == [rows[2].id]
+    assert all(row.digested_at is not None for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_real_format_change_is_sent(session):
+    rows = _seed_format_changes(session, "online", [("format", "in_person", "online")])
+    sender = Sender()
+    service = DigestService(lambda: session, sender)
+
+    result = await service.send_daily_digest(now=datetime(2026, 9, 28, 3, tzinfo=UTC))
+    assert result["status"] == "sent"
+    assert "Updated: format" in sender.bodies[0]
+    assert rows[0].digested_at is not None
+
+
 @pytest.mark.asyncio
 async def test_partial_delivery_retries_only_unsent_chunk(session, candidate, config, organizers):
     assessment = await assess_candidate(candidate, config, organizers)

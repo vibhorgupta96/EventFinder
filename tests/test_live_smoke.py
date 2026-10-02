@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 from eventfinder.config import SourceDefinition, SourcesRegistry
 from eventfinder.domain import FetchResult
@@ -68,16 +69,24 @@ def test_live_smoke_parser_accepts_repeatable_targeted_sources():
 @pytest.mark.asyncio
 async def test_live_smoke_selects_requested_enabled_source_only(config, organizers, monkeypatch):
     called: list[str] = []
+    timeouts: list[float] = []
+    injected_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200)))
+
+    def client_factory(*, timeout):
+        timeouts.append(timeout)
+        return injected_client
 
     class EmptySource:
         async def fetch(self):
             return FetchResult()
 
-    def source_factory(definition, *_args, **_kwargs):
+    def source_factory(definition, client, *_args, **_kwargs):
         called.append(definition.name)
+        assert client is injected_client
         return EmptySource()
 
     monkeypatch.setattr("eventfinder.service.make_source", source_factory)
+    monkeypatch.setattr("eventfinder.live_smoke.make_public_fetch_client", client_factory)
     sources = SourcesRegistry(
         sources=[
             SourceDefinition(name="first", adapter="public_page", url="https://events.example.test/first"),
@@ -95,6 +104,7 @@ async def test_live_smoke_selects_requested_enabled_source_only(config, organize
         emit=lambda _line: None,
     )
     assert called == ["target"]
+    assert timeouts == [1]
     assert [observation.source_name for observation in summary.observations] == ["target"]
 
 

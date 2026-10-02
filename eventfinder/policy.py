@@ -129,7 +129,7 @@ def _topic_match(candidate: EventCandidate, config: FileConfig) -> bool:
 def _excluded(candidate: EventCandidate, config: FileConfig) -> bool:
     text = " ".join(filter(None, [candidate.title, candidate.description or ""])).lower()
     terms = set(EXCLUDED_TERMS) | {term.lower() for term in config.topics.get("exclude", [])}
-    return any(term in text for term in terms)
+    return any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) for term in terms)
 
 
 def _ineligible(candidate: EventCandidate) -> bool:

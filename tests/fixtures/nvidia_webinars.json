@@ -1,0 +1,41 @@
+{
+  "timeStamp": "sanitized public-feed fixture",
+  "data": [
+    {
+      "eventId": 5503388,
+      "title": "NVIDIA Certification: Your Roadmap Across the AI Stack",
+      "type": "Upcoming",
+      "liveStartTimeInUTC": 1795074300000,
+      "liveEndTimeInUTC": 1795078800000,
+      "eventStartDate": "Nov 19, 2026 9:00 AM CET",
+      "eventAbstract": "<p>AI application development, infrastructure and certification roadmap.</p>",
+      "mediaType": "Webcast",
+      "isPublic": "N",
+      "isPublished": "",
+      "canonicalUrl": "",
+      "webcastPreviewUrl": ""
+    },
+    {
+      "eventId": 5503271,
+      "title": "NVIDIA Certification: Your Roadmap Across the AI Stack",
+      "type": "Upcoming",
+      "liveStartTimeInUTC": 1795106700000,
+      "liveEndTimeInUTC": 1795111200000,
+      "eventStartDate": "Nov 19, 2026 9:00 AM PST",
+      "eventAbstract": "<p>AI application development, infrastructure and certification roadmap.</p>",
+      "mediaType": "Webcast",
+      "isPublic": "N",
+      "isPublished": "",
+      "canonicalUrl": "",
+      "webcastPreviewUrl": ""
+    },
+    {
+      "eventId": 4400000,
+      "title": "Recorded AI workshop",
+      "type": "On Demand",
+      "liveStartTimeInUTC": 1760000000000,
+      "liveEndTimeInUTC": 1760003600000,
+      "mediaType": "Webcast"
+    }
+  ]
+}

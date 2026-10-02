@@ -49,6 +49,13 @@ async def test_mixed_free_and_paid_wording_is_rejected(candidate, config, organi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("title", "expected"), [("Salesforce AI Engineering Workshop", "eligible"), ("AI sales workshop", "rejected")])
+async def test_excluded_terms_match_words_without_rejecting_salesforce(candidate, config, organizers, title, expected):
+    candidate.title = title
+    assert (await assess_candidate(candidate, config, organizers)).status == expected
+
+
+@pytest.mark.asyncio
 async def test_trusted_global_online_is_allowed(candidate, config, organizers):
     candidate.city = "New York"
     candidate.venue = None

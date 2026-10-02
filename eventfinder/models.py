@@ -111,6 +111,8 @@ class DigestDelivery(SQLModel, table=True):
     digest_run_id: int = Field(foreign_key="digest_runs.id", index=True)
     chunk_index: int
     body: str
+    # NULL denotes a delivery saved before chunk-to-change attribution existed.
+    event_change_ids: list[int] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     telegram_message_id: str | None = None
     sent_at: datetime | None = None
     error: str | None = None

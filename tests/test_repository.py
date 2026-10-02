@@ -93,6 +93,159 @@ async def test_cross_posting_differing_only_by_utm_param_and_host_case_dedupes(
 
 
 @pytest.mark.asyncio
+async def test_meetup_recommendation_variant_finds_sparse_existing_row(
+    session, candidate, config, organizers
+):
+    sparse = candidate.model_copy(deep=True)
+    sparse.canonical_url = "https://www.meetup.com/python-bengaluru/events/310000001/?recId=abc"
+    sparse.source_url = sparse.canonical_url
+    sparse.starts_at = None
+    sparse.venue = None
+    sparse.city = None
+    sparse.format = EventFormat.UNKNOWN
+    assessment = await assess_candidate(candidate, config, organizers)
+    event, _, created = upsert_candidate(session, sparse, assessment)
+    assert created is True
+
+    detailed = candidate.model_copy(deep=True)
+    detailed.canonical_url = (
+        "https://www.meetup.com/python-bengaluru/events/310000001/"
+        "?searchId=xyz&eventOrigin=home_page"
+    )
+    detailed.source_url = detailed.canonical_url
+    merged, _, created = upsert_candidate(session, detailed, assessment)
+
+    assert created is False
+    assert merged.id == event.id
+    assert merged.starts_at == candidate.starts_at
+    assert merged.venue == candidate.venue
+    assert merged.canonical_url == sparse.canonical_url
+    assert set(merged.source_urls) == {sparse.source_url, detailed.source_url}
+
+
+@pytest.mark.asyncio
+async def test_meetup_exact_sparse_url_updates_richer_historical_row(
+    session, candidate, config, organizers
+):
+    sparse_url = "https://www.meetup.com/python-bengaluru/events/310000001/?recId=old"
+    rich_url = (
+        "https://www.meetup.com/python-bengaluru/events/310000001/"
+        "?searchId=old&eventOrigin=search"
+    )
+    sparse = Event(
+        canonical_url=sparse_url,
+        normalized_key="old-sparse-key",
+        title=candidate.title,
+        status="needs_review",
+    )
+    rich = Event(
+        canonical_url=rich_url,
+        normalized_key="old-rich-key",
+        title=candidate.title,
+        organizer=candidate.organizer,
+        description=candidate.description,
+        starts_at=candidate.starts_at,
+        venue=candidate.venue,
+        city=candidate.city,
+        format=candidate.format.value,
+        registration_state=candidate.registration_state.value,
+        status="eligible",
+    )
+    session.add_all([sparse, rich])
+    session.commit()
+
+    observation = candidate.model_copy(deep=True)
+    observation.canonical_url = sparse_url  # exact URL must not win over richer evidence
+    observation.source_url = (
+        "https://www.meetup.com/python-bengaluru/events/310000001/?recSource=notification"
+    )
+    updated, changes, created = upsert_candidate(
+        session, observation, await assess_candidate(observation, config, organizers)
+    )
+
+    assert created is False
+    assert updated.id == rich.id
+    assert updated.source_urls == [observation.source_url]
+    assert changes == []
+    assert session.exec(select(EventSource).where(EventSource.event_id == rich.id)).one().source_url == observation.source_url
+    assert len(session.exec(select(Event)).all()) == 2
+    assert session.exec(select(EventChange)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_meetup_eligible_row_wins_over_richer_review_row(
+    session, candidate, config, organizers
+):
+    eligible_url = "https://www.meetup.com/python-bengaluru/events/310000001/?recId=old"
+    review_url = (
+        "https://www.meetup.com/python-bengaluru/events/310000001/"
+        "?searchId=old&eventOrigin=search"
+    )
+    eligible = Event(
+        canonical_url=eligible_url,
+        normalized_key="old-eligible-key",
+        title=candidate.title,
+        starts_at=candidate.starts_at,
+        venue=candidate.venue,
+        format=candidate.format.value,
+        registration_state=candidate.registration_state.value,
+        status="eligible",
+    )
+    richer_review = Event(
+        canonical_url=review_url,
+        normalized_key="old-review-key",
+        title=candidate.title,
+        organizer=candidate.organizer,
+        description=candidate.description,
+        starts_at=candidate.starts_at,
+        ends_at=candidate.starts_at + timedelta(hours=2),
+        venue=candidate.venue,
+        city=candidate.city,
+        format=candidate.format.value,
+        registration_state=candidate.registration_state.value,
+        status="needs_review",
+    )
+    session.add_all([eligible, richer_review])
+    session.commit()
+
+    observation = candidate.model_copy(deep=True)
+    observation.canonical_url = review_url  # exact match must not promote a second eligible row
+    observation.source_url = (
+        "https://www.meetup.com/python-bengaluru/events/310000001/?recSource=notification"
+    )
+    updated, changes, created = upsert_candidate(
+        session, observation, await assess_candidate(observation, config, organizers)
+    )
+
+    assert created is False
+    assert updated.id == eligible.id
+    assert updated.source_urls == [observation.source_url]
+    assert changes == []
+    assert richer_review.status == "needs_review"
+    assert len(session.exec(select(Event).where(Event.status == "eligible")).all()) == 1
+    assert session.exec(select(EventChange)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_distinct_meetup_event_ids_do_not_merge_on_matching_metadata(
+    session, candidate, config, organizers
+):
+    assessment = await assess_candidate(candidate, config, organizers)
+    first = candidate.model_copy(deep=True)
+    first.canonical_url = "https://www.meetup.com/python-bengaluru/events/310000001/?recId=abc"
+    first.source_url = first.canonical_url
+    event, _, _ = upsert_candidate(session, first, assessment)
+
+    second = candidate.model_copy(deep=True)
+    second.canonical_url = "https://www.meetup.com/python-bengaluru/events/310000002/?recId=abc"
+    second.source_url = second.canonical_url
+    distinct, _, created = upsert_candidate(session, second, assessment)
+
+    assert created is True
+    assert distinct.id != event.id
+
+
+@pytest.mark.asyncio
 async def test_material_registration_and_schedule_changes_are_immutable(session, candidate, config, organizers):
     assessment = await assess_candidate(candidate, config, organizers)
     event, _, _ = upsert_candidate(session, candidate, assessment)
@@ -104,6 +257,41 @@ async def test_material_registration_and_schedule_changes_are_immutable(session,
     assert {change.change_type for change in changes} == {"registration_state", "schedule"}
     stored_changes = list(session.exec(select(EventChange).where(EventChange.event_id == event.id)).all())
     assert len(stored_changes) == 3
+
+
+@pytest.mark.asyncio
+async def test_registration_url_tracking_variants_do_not_create_changes(
+    session, candidate, config, organizers
+):
+    assessment = await assess_candidate(candidate, config, organizers)
+    event, _, _ = upsert_candidate(session, candidate, assessment)
+    first_url = "https://www.meetup.com/python-bengaluru/events/310000001/?recId=first"
+    first = candidate.model_copy(deep=True)
+    first.registration_url = first_url
+    _, changes, _ = upsert_candidate(session, first, assessment)
+    assert [change.change_type for change in changes] == ["registration_url"]
+    assert changes[0].old_value is None
+
+    tracking_url = (
+        "https://www.meetup.com/python-bengaluru/events/310000001/"
+        "?recSource=search&searchId=second&eventOrigin=home_page"
+    )
+    tracking = candidate.model_copy(deep=True)
+    tracking.registration_url = tracking_url
+    updated, changes, _ = upsert_candidate(session, tracking, assessment)
+    assert changes == []
+    assert updated.id == event.id
+    assert updated.registration_url == tracking_url
+
+    functional = candidate.model_copy(deep=True)
+    functional.registration_url = tracking_url + "&ticket=vip"
+    _, changes, _ = upsert_candidate(session, functional, assessment)
+    assert [change.change_type for change in changes] == ["registration_url"]
+
+    new_destination = candidate.model_copy(deep=True)
+    new_destination.registration_url = "https://tickets.example.test/python-meetup"
+    _, changes, _ = upsert_candidate(session, new_destination, assessment)
+    assert [change.change_type for change in changes] == ["registration_url"]
 
 
 @pytest.mark.asyncio
@@ -172,6 +360,136 @@ async def test_rejected_new_candidate_is_not_stored_but_paid_update_is(session, 
     assert updated.status == "rejected"
     assert updated.price_status == "paid"
     assert "price" in {change.change_type for change in changes}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["paid", "unverified_online", "incompatible_eligibility"])
+@pytest.mark.parametrize("initial_price", [None, "Free"])
+async def test_lower_trust_rejection_preserves_eligible_event_and_provenance(
+    session, candidate, config, organizers, reason, initial_price
+):
+    candidate.price_text = initial_price
+    candidate.format = EventFormat.ONLINE
+    candidate.city = None
+    candidate.venue = None
+    event, _, _ = upsert_candidate(session, candidate, await assess_candidate(candidate, config, organizers))
+    previous_reason = event.relevance_reason
+    weaker = candidate.model_copy(deep=True)
+    weaker.source_name = "luma_bengaluru"
+    weaker.source_url = "https://lu.ma/unverified-crosspost"
+    weaker.evidence = SourceEvidence(
+        source_name=weaker.source_name,
+        source_url=weaker.source_url,
+        observed_at=datetime.now(UTC),
+    )
+    if reason == "paid":
+        weaker.price_text = "INR 499"
+        weaker.is_explicitly_paid = True
+    elif reason == "incompatible_eligibility":
+        weaker.eligibility_text = "Students only"
+    assessment = await assess_candidate(weaker, config, organizers)
+    assert assessment.status == "rejected"
+    assert assessment.organizer_trust == "low"
+
+    updated, changes, created = upsert_candidate(session, weaker, assessment)
+
+    assert created is False
+    assert updated.id == event.id
+    assert updated.status == "eligible"
+    assert updated.price_status == ("free" if initial_price else "not_stated")
+    assert updated.price_text == initial_price
+    assert updated.eligibility_text is None
+    assert updated.organizer_trust == "high"
+    assert updated.relevance_reason == previous_reason
+    assert changes == []
+    evidence = session.exec(select(EventSource).where(EventSource.source_url == weaker.source_url)).one().evidence
+    assert evidence["organizer_trust"] == "low"
+    if reason == "paid":
+        assert evidence["unmerged_facts"]["price_text"] == "INR 499"
+        assert evidence["unmerged_facts"]["is_explicitly_paid"] is True
+    elif reason == "incompatible_eligibility":
+        assert evidence["unmerged_facts"]["eligibility_text"] == "Students only"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_price", [None, "Free"])
+async def test_higher_trust_paid_rejection_remains_authoritative(session, candidate, config, organizers, initial_price):
+    candidate.organizer = "Unknown organizer"
+    candidate.source_name = "luma_bengaluru"
+    candidate.price_text = initial_price
+    event, _, _ = upsert_candidate(session, candidate, await assess_candidate(candidate, config, organizers))
+    assert event.organizer_trust == "low"
+    paid = candidate.model_copy(deep=True)
+    paid.organizer = "Google Developer Groups Bengaluru"
+    paid.source_name = "gdg_bengaluru"
+    paid.source_url = "https://events.example.test/official-update"
+    paid.price_text = "INR 499"
+    paid.is_explicitly_paid = True
+    assessment = await assess_candidate(paid, config, organizers)
+    assert assessment.organizer_trust == "high"
+
+    updated, changes, _ = upsert_candidate(session, paid, assessment)
+
+    assert updated.id == event.id
+    assert updated.status == "rejected"
+    assert updated.price_status == "paid"
+    assert updated.price_text == "INR 499"
+    assert {change.change_type for change in changes} >= {"price", "lifecycle"}
+
+
+@pytest.mark.asyncio
+async def test_lower_trust_rejected_end_time_cannot_expire_future_event(
+    session, candidate, config, organizers
+):
+    candidate.price_text = "Free"
+    assert candidate.ends_at is None
+    event, _, _ = upsert_candidate(session, candidate, await assess_candidate(candidate, config, organizers))
+    weaker = candidate.model_copy(deep=True)
+    weaker.source_name = "luma_bengaluru"
+    weaker.source_url = "https://lu.ma/rejected-past-end"
+    weaker.ends_at = datetime.now(UTC) - timedelta(days=1)
+    weaker.price_text = "INR 499"
+    weaker.is_explicitly_paid = True
+    assessment = await assess_candidate(weaker, config, organizers)
+    assert assessment.status == "rejected"
+    assert assessment.organizer_trust == "low"
+
+    updated, changes, _ = upsert_candidate(session, weaker, assessment)
+
+    assert updated.id == event.id
+    assert updated.status == "eligible"
+    assert updated.starts_at == candidate.starts_at
+    assert updated.ends_at is None
+    assert updated.price_status == "free"
+    assert changes == []
+    assert expire_past_events(session) == 0
+    assert [listed.id for listed in list_events(session)] == [event.id]
+    source = session.exec(select(EventSource).where(EventSource.source_url == weaker.source_url)).one()
+    assert source.evidence["unmerged_facts"]["ends_at"] == weaker.ends_at.isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_trust", ["low", "high"])
+async def test_trusted_eligibility_rejection_remains_authoritative(
+    session, candidate, config, organizers, initial_trust
+):
+    official = candidate.model_copy(deep=True)
+    if initial_trust == "low":
+        candidate.organizer = "Unknown organizer"
+        candidate.source_name = "luma_bengaluru"
+    event, _, _ = upsert_candidate(session, candidate, await assess_candidate(candidate, config, organizers))
+    assert event.organizer_trust == initial_trust
+    official.source_url = "https://events.example.test/official-eligibility"
+    official.eligibility_text = "Students only"
+    assessment = await assess_candidate(official, config, organizers)
+    assert assessment.organizer_trust == "high"
+
+    updated, changes, _ = upsert_candidate(session, official, assessment)
+
+    assert updated.id == event.id
+    assert updated.status == "rejected"
+    assert updated.eligibility_text == "Students only"
+    assert "lifecycle" in {change.change_type for change in changes}
 
 
 @pytest.mark.asyncio

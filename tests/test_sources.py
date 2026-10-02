@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
+from math import isnan
 from pathlib import Path
 
 import httpx
@@ -16,6 +18,7 @@ from eventfinder.sources import (
     RobotsPolicy,
     SearchEventSource,
     SourceFetchError,
+    _is_interstitial,
     _label_time,
     _request_redirect_checked,
     make_source,
@@ -89,9 +92,19 @@ def test_label_time_dayfirst_toggle_changes_ambiguous_numeric_date_parsing():
     assert dayfirst != monthfirst
 
 
-@pytest.mark.parametrize("garbage", ["Coming soon 2026", "TBD"])
+@pytest.mark.parametrize("garbage", ["Coming soon 2026", "TBD", "October 2026", "October 2026 10:00", "2026-10", "10/2026"])
 def test_label_time_fails_closed_on_garbage_without_a_real_month_or_day(garbage):
     assert _label_time(garbage) is None
+
+
+@pytest.mark.parametrize("label", ["October 11, 2026", "11 October 2026", "11th October 2026", "2026-10-11", "11/10/2026"])
+def test_label_time_accepts_only_fully_supplied_dates(label):
+    assert _label_time(label) == datetime(2026, 10, 10, 18, 30, tzinfo=UTC)
+
+
+def test_month_only_semantic_date_does_not_create_an_event_date():
+    html = "<main><h1>AI Meetup</h1><dl><dt>Date</dt><dd>October 2026</dd></dl></main>"
+    assert parse_event_page(html, "https://events.example.test/event", "fixture") == []
 
 
 def test_garbage_date_never_fabricates_a_starts_at_on_a_real_candidate():
@@ -134,6 +147,10 @@ def test_schema_lifecycle_and_offer_facts_are_extracted(event_status, availabili
         ("eventbrite", "Free", False),
         ("official", "0", False),
         ("official", "Nada", False),
+        ("official", "EUR 50", True),
+        ("official", "CAD 50", True),
+        ("official", "EUR50", True),
+        ("official", "CAD50", True),
     ],
 )
 async def test_semantic_price_evidence_marks_paid_events_for_policy(
@@ -170,6 +187,220 @@ async def test_multiple_schema_offers_preserve_paid_tier_evidence_for_policy(con
     assert candidate.price_text == "INR 0; INR 499"
     assert candidate.is_explicitly_paid is True
     assert (await assess_candidate(candidate, config, organizers)).status == "rejected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("offers", "price_text", "is_paid"),
+    [
+        ([{"price": 0}, {"price": 499}], "0; 499", True),
+        ([0, 50], "0; 50", True),
+        ([{"price": "Free"}, {"price": 50}], "Free; 50", True),
+        ([{"price": "EUR 50"}], "EUR 50", True),
+        ([{"price": "EUR50"}], "EUR50", True),
+        ([{"price": "CAD50"}], "CAD50", True),
+        ([{"price": 50, "priceCurrency": "CAD"}], "CAD 50", True),
+        ([{"price": 0}, {"price": 50, "priceCurrency": "CHF"}], "0; CHF 50", True),
+        ([{"price": 0}, {"name": "Unpublished tier"}], "0", False),
+        ([{"name": "Unpublished tier"}], None, False),
+    ],
+)
+async def test_each_schema_offer_is_assessed_without_losing_price_evidence(config, organizers, offers, price_text, is_paid):
+    node = {
+        "@type": "Event", "name": "Bengaluru AI Workshop",
+        "startDate": "2026-10-10T10:00:00+05:30", "location": {"name": "Bengaluru"},
+        "offers": offers,
+    }
+    html = f"<script type='application/ld+json'>{json.dumps(node)}</script>"
+    candidate = parse_event_page(html, "https://events.example.test/price", "fixture")[0]
+    assert candidate.price_text == price_text
+    assert candidate.is_explicitly_paid is is_paid
+    assert candidate.evidence.facts["event"]["offers"] == offers
+    assert (await assess_candidate(candidate, config, organizers)).status == ("rejected" if is_paid else "eligible")
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        "<script>DevPro__enable_devsite_captcha = true</script><h1>Event calendar</h1>",
+        "<style>.captcha { display: none; }</style><h1>Event calendar</h1>",
+        "<div hidden>Verify you are human</div><h1>Event calendar</h1>",
+        "<div style='display: none'><span style='color: red'>Access denied</span></div><h1>Calendar</h1>",
+        "<h1>Engineering CAPTCHA systems</h1><p>Workshop on bot detection.</p>",
+    ],
+)
+def test_interstitial_detection_ignores_inert_flags_and_event_content(html):
+    assert _is_interstitial(html) is False
+
+
+@pytest.mark.parametrize(
+    "html",
+    ["<h1>Verify you are human</h1>", "<h1>Access denied</h1>", "Checking your browser before accessing", "<h1>CAPTCHA</h1>", "<p>Please complete the CAPTCHA</p>", "<div class='g-recaptcha'></div>"],
+)
+def test_interstitial_detection_still_rejects_visible_challenges(html):
+    assert _is_interstitial(html) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_name", "detail_count"), [("google_search_central", 4), ("google_developers", 1)])
+async def test_google_calendar_flags_do_not_block_configured_rsvp_hydration(source_name, detail_count):
+    definition = next(source for source in get_sources_registry().sources if source.name == source_name)
+    definition = definition.model_copy(update={"rate_limit_seconds": 0})
+    listing = "<script>DevPro__enable_devsite_captcha = true;</script><h1>Events</h1>" + "".join(
+        f"<a href='https://rsvp.withgoogle.com/events/fixture-{index}'>Event {index}</a>"
+        for index in range(detail_count)
+    )
+    requested_details = []
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        if request.url.host == "developers.google.com":
+            return httpx.Response(200, text=listing)
+        requested_details.append(str(request.url))
+        node = {"@type": "Event", "name": f"AI workshop {request.url.path}", "startDate": "2026-10-30T09:00:00+05:30"}
+        return httpx.Response(200, text=f"<script type='application/ld+json'>{json.dumps(node)}</script>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(definition, client, RobotsPolicy(client, _safety()), _safety())
+        result = await source.fetch()
+    assert len(requested_details) == detail_count
+    assert len(result.candidates) == detail_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "calendar_fixture", "detail_fixture", "detail_path", "title", "start"),
+    [
+        ("hasgeek", "hasgeek_calendar.html", "hasgeek_calendar_event.html", "/rootconf/2026/", "Rootconf 2026 Annual Conference", datetime(2026, 11, 13, 3, 30, tzinfo=UTC)),
+        ("gdg_bengaluru", "gdg_bangalore_calendar.html", "gdg_bangalore_event.html", "/events/details/google-gdg-bangalore-presents-build-with-gemini-bangalore/", "Build with Gemini - Bangalore", datetime(2026, 9, 29, 3, 30, tzinfo=UTC)),
+    ],
+)
+async def test_repaired_calendar_routes_hydrate_only_configured_official_event_links(name, calendar_fixture, detail_fixture, detail_path, title, start):
+    definition = next(source for source in get_sources_registry().sources if source.name == name)
+    definition = definition.model_copy(update={"rate_limit_seconds": 0})
+    requested_details = []
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        if str(request.url) == definition.url:
+            return httpx.Response(200, text=Path(f"tests/fixtures/{calendar_fixture}").read_text())
+        requested_details.append(request.url.path)
+        assert request.url.path == detail_path
+        return httpx.Response(200, text=Path(f"tests/fixtures/{detail_fixture}").read_text())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(definition, client, RobotsPolicy(client, _safety()), _safety())
+        result = await source.fetch()
+    assert requested_details == [detail_path]
+    event = next(candidate for candidate in result.candidates if candidate.starts_at)
+    assert event.title == title
+    assert event.starts_at == start
+    assert event.city == "Bengaluru"
+    assert event.evidence.facts["event"]["startDate"]
+
+
+def test_nvidia_feed_preserves_upcoming_event_identity_and_raw_facts_without_inferences():
+    definition = next(source for source in get_sources_registry().sources if source.name == "nvidia_developer")
+    text = Path("tests/fixtures/nvidia_webinars.json").read_text()
+    candidates = parse_event_page(text, definition.url, definition.name, platform=definition.platform)
+    assert len(candidates) == 2
+    upcoming_rows = [row for row in json.loads(text)["data"] if row["type"] == "Upcoming"]
+    expected_starts = [datetime(2026, 11, 19, 8, tzinfo=UTC), datetime(2026, 11, 19, 17, tzinfo=UTC)]
+    for candidate, row, expected_start in zip(candidates, upcoming_rows, expected_starts, strict=True):
+        assert candidate.canonical_url == f"https://www.nvidia.com/en-us/about-nvidia/webinar-portal/#/webinar/{row['eventId']}"
+        assert candidate.starts_at == expected_start
+        assert candidate.ends_at == datetime.fromtimestamp(row["liveEndTimeInUTC"] / 1000, UTC)
+        assert candidate.organizer is None
+        assert candidate.price_text is None
+        assert candidate.is_explicitly_paid is False
+        assert candidate.registration_state.value == "unknown"
+        assert candidate.registration_url is None
+        assert candidate.format.value == "online"
+        assert candidate.evidence.source_url == definition.url
+        assert candidate.evidence.raw_id == str(row["eventId"])
+        assert candidate.evidence.facts["parser"] == "nvidia_webinar_feed"
+        assert candidate.evidence.facts["event"] == row
+        assert candidate.evidence.facts["scheduled_start_field"] == "eventStartDate"
+        assert candidate.evidence.facts["start_time_disagreement"] == {
+            "displayed_start": expected_start.isoformat(),
+            "live_start": datetime.fromtimestamp(row["liveStartTimeInUTC"] / 1000, UTC).isoformat(),
+        }
+        assert "<p>" not in candidate.description
+    assert candidates[0].canonical_url != candidates[1].canonical_url
+
+
+@pytest.mark.parametrize("payload", ["{bad}", "[]", "{}", '{"data":{}}'])
+def test_nvidia_feed_rejects_malformed_payloads(payload):
+    assert parse_event_page(payload, "https://www.nvidia.com/feed.json", "fixture", platform="nvidia_webinar") == []
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"eventId": True}, {"eventId": 0}, {"eventId": "../unsafe"}, {"eventId": 12.5},
+        {"title": ""}, {"type": "On Demand"},
+    ],
+)
+def test_nvidia_feed_skips_malformed_or_recorded_rows_without_fabricating_facts(update):
+    row = {"eventId": 5503388, "title": "AI workshop", "type": "Upcoming", "liveStartTimeInUTC": 1795074300000}
+    row.update(update)
+    text = json.dumps({"data": [row]})
+    assert parse_event_page(text, "https://www.nvidia.com/feed.json", "fixture", platform="nvidia_webinar") == []
+
+
+@pytest.mark.parametrize("timestamp", [True, 0, "1795074300000", float("inf"), float("nan")])
+def test_nvidia_invalid_epoch_remains_unknown_without_a_displayed_schedule(timestamp):
+    row = {"eventId": 5503388, "title": "AI workshop", "type": "Upcoming", "liveStartTimeInUTC": timestamp}
+    candidate = parse_event_page(json.dumps({"data": [row]}), "https://www.nvidia.com/feed.json", "fixture", platform="nvidia_webinar")[0]
+    assert candidate.starts_at is None
+    assert candidate.ends_at is None
+    observed_timestamp = candidate.evidence.facts["event"]["liveStartTimeInUTC"]
+    if isinstance(timestamp, float) and isnan(timestamp):
+        assert isnan(observed_timestamp)
+    else:
+        assert observed_timestamp == timestamp
+
+
+@pytest.mark.parametrize("displayed", ["November 2026 9:00 AM CET", "Nov 19, 2026 9:00 AM XYZ", "Nov 19, 2026 9:00 AM", "TBD", False])
+def test_nvidia_invalid_displayed_date_never_falls_back_to_a_different_epoch_schedule(displayed):
+    row = {"eventId": 5503388, "title": "AI workshop", "type": "Upcoming", "eventStartDate": displayed, "liveStartTimeInUTC": 1795074300000, "liveEndTimeInUTC": 1795078800000}
+    candidate = parse_event_page(json.dumps({"data": [row]}), "https://www.nvidia.com/feed.json", "fixture", platform="nvidia_webinar")[0]
+    assert candidate.starts_at is None
+    assert candidate.ends_at is None
+    assert candidate.evidence.facts["scheduled_start_field"] == "eventStartDate"
+    assert candidate.evidence.facts["start_time_error"]
+    assert candidate.evidence.facts["event"] == row
+
+
+def test_nvidia_epoch_fallback_requires_an_absent_displayed_date_and_invalid_end_is_not_claimed():
+    row = {"eventId": 5503388, "title": "AI workshop", "type": "Upcoming", "liveStartTimeInUTC": 1795074300000, "liveEndTimeInUTC": 1795074200000}
+    candidate = parse_event_page(json.dumps({"data": [row]}), "https://www.nvidia.com/feed.json", "fixture", platform="nvidia_webinar")[0]
+    assert candidate.starts_at == datetime.fromtimestamp(row["liveStartTimeInUTC"] / 1000, UTC)
+    assert candidate.ends_at is None
+    assert candidate.evidence.facts["scheduled_start_field"] == "liveStartTimeInUTC"
+
+
+@pytest.mark.asyncio
+async def test_nvidia_feed_collection_fetches_no_registration_provider():
+    definition = next(source for source in get_sources_registry().sources if source.name == "nvidia_developer")
+    definition = definition.model_copy(update={"rate_limit_seconds": 0})
+    requests = []
+
+    def handler(request):
+        requests.append(str(request.url))
+        assert request.url.host == "www.nvidia.com"
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /")
+        assert str(request.url) == definition.url
+        return httpx.Response(200, text=Path("tests/fixtures/nvidia_webinars.json").read_text(), headers={"Content-Type": "application/json"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        source = PublicPageEventSource(definition, client, RobotsPolicy(client, _safety()), _safety())
+        result = await source.fetch()
+    assert len(result.candidates) == 2
+    assert requests == ["https://www.nvidia.com/robots.txt", definition.url]
 
 
 @pytest.mark.parametrize(
@@ -409,6 +640,94 @@ def test_explicit_json_ld_offline_mode_outranks_semantic_format():
 
     assert len(candidates) == 1
     assert candidates[0].format.value == "in_person"
+
+
+def test_event_json_ld_schedule_outranks_registration_closing_label():
+    html = """<script type='application/ld+json'>
+    {"@type":"Event","name":"Python Meetup",
+    "url":"https://www.meetup.com/python-bengaluru/events/310000001/",
+    "startDate":"2026-10-11T10:30:00+05:30",
+    "endDate":"2026-10-11T12:30:00+05:30"}
+    </script><main><h1>Python Meetup</h1><dl>
+    <dt>Date and time</dt><dd>2026-10-11 09:30 IST</dd>
+    <dt>Ends</dt><dd>2026-10-11 10:00 IST</dd>
+    <dt>Registration deadline</dt><dd>2026-10-11 09:30 IST</dd>
+    </dl></main>"""
+    candidate = parse_event_page(
+        html, "https://www.meetup.com/python-bengaluru/events/310000001/", "meetup_fixture"
+    )[0]
+
+    assert candidate.starts_at == datetime(2026, 10, 11, 5, tzinfo=UTC)
+    assert candidate.ends_at == datetime(2026, 10, 11, 7, tzinfo=UTC)
+    assert candidate.registration_deadline == datetime(2026, 10, 11, 4, tzinfo=UTC)
+
+
+def test_meetup_recommendation_urls_merge_only_same_event_id():
+    html = """<script type='application/ld+json'>
+    {"@type":"Event","name":"Python Meetup",
+    "url":"https://www.meetup.com/python-bengaluru/events/310000001/?recId=abc&recSource=search"}
+    </script><script type='application/ld+json'>
+    {"@type":"Event","name":"Python Meetup",
+    "url":"https://www.meetup.com/python-bengaluru/events/310000001/?searchId=xyz&eventOrigin=home_page",
+    "startDate":"2026-10-11T10:30:00+05:30", "location":{"name":"Bengaluru Hall"}}
+    </script><script type='application/ld+json'>
+    {"@type":"Event","name":"Python Meetup",
+    "url":"https://www.meetup.com/python-bengaluru/events/310000002/?recId=abc",
+    "startDate":"2026-10-11T10:30:00+05:30", "location":{"name":"Bengaluru Hall"}}
+    </script>"""
+    candidates = parse_event_page(html, "https://www.meetup.com/python-bengaluru/events/", "meetup_fixture")
+
+    assert len(candidates) == 2
+    merged = next(candidate for candidate in candidates if "310000001" in candidate.canonical_url)
+    assert merged.starts_at == datetime(2026, 10, 11, 5, tzinfo=UTC)
+    assert merged.venue == "Bengaluru Hall"
+    assert merged.canonical_url.endswith("?searchId=xyz&eventOrigin=home_page")
+    assert len(merged.evidence.facts["merged_observations"]) == 2
+
+
+def test_later_detail_json_ld_schedule_corrects_earlier_listing_schedule():
+    html = """<script type='application/ld+json'>
+    {"@type":"Event","name":"Python Meetup","url":"/group/events/310000001/",
+    "startDate":"2026-10-11T10:00:00+05:30"}
+    </script><script type='application/ld+json'>
+    {"@type":"Event","name":"Python Meetup","url":"/group/events/310000001/",
+    "startDate":"2026-10-11T10:30:00+05:30"}
+    </script><main><h1>Python Meetup</h1><dl>
+    <dt>Date and time</dt><dd>2026-10-11 09:30 IST</dd></dl></main>"""
+
+    candidate = parse_event_page(
+        html, "https://www.meetup.com/group/events/310000001/", "meetup_fixture"
+    )[0]
+    assert candidate.starts_at == datetime(2026, 10, 11, 5, tzinfo=UTC)
+
+
+def test_semantic_schedule_supplies_missing_json_ld_date():
+    html = """<script type='application/ld+json'>
+    {"@type":"Event","name":"Python Meetup","url":"/group/events/310000001/"}
+    </script><main><h1>Python Meetup</h1><dl>
+    <dt>Date and time</dt><dd>2026-10-11 10:30 IST</dd></dl></main>"""
+
+    candidate = parse_event_page(
+        html, "https://www.meetup.com/group/events/310000001/", "meetup_fixture"
+    )[0]
+    assert candidate.starts_at == datetime(2026, 10, 11, 5, tzinfo=UTC)
+
+
+def test_date_only_json_ld_does_not_override_semantic_clock_time():
+    schema = """<script type='application/ld+json'>
+    {"@type":"Event","name":"Python Meetup","url":"/group/events/310000001/",
+    "startDate":"2026-10-11", "endDate":"2026-10-11"}
+    </script>"""
+    labels = """<main><h1>Python Meetup</h1><dl>
+    <dt>Date and time</dt><dd>2026-10-11 10:30 IST</dd>
+    <dt>Ends</dt><dd>2026-10-11 12:30 IST</dd></dl></main>"""
+    url = "https://www.meetup.com/group/events/310000001/"
+
+    precise = parse_event_page(schema + labels, url, "meetup_fixture")[0]
+    assert precise.starts_at == datetime(2026, 10, 11, 5, tzinfo=UTC)
+    assert precise.ends_at == datetime(2026, 10, 11, 7, tzinfo=UTC)
+    date_only = parse_event_page(schema, url, "meetup_fixture")[0]
+    assert date_only.starts_at == datetime(2026, 10, 10, 18, 30, tzinfo=UTC)
 
 
 def test_combined_in_person_and_online_label_is_hybrid():

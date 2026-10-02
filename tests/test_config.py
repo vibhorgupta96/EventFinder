@@ -74,6 +74,22 @@ def test_new_source_routes_and_external_provider_boundaries_are_explicit():
     assert sources["databricks_events"].detail_link_prefixes == ["/resources/webinar/"]
 
 
+def test_repaired_existing_calendars_have_bounded_official_detail_contracts():
+    sources = {source.name: source for source in get_sources_registry().sources}
+    assert sources["hasgeek"].url == "https://hasgeek.com/"
+    assert sources["hasgeek"].detail_link_selectors == ["ul.upcoming a.card--upcoming[href]"]
+    assert sources["hasgeek"].max_pages == 1
+    assert sources["hasgeek"].pagination_param is None
+    assert sources["hasgeek"].max_detail_pages == 4
+    assert sources["gdg_bengaluru"].url == "https://gdg.community.dev/gdg-bangalore/"
+    assert sources["gdg_bengaluru"].detail_link_prefixes == ["/events/details/google-gdg-bangalore-presents-"]
+    assert sources["gdg_bengaluru"].max_detail_pages == 4
+    assert sources["nvidia_developer"].url == "https://www.nvidia.com/content/dam/en-zz/Solutions/about-nvidia/webinar/webinarJSONData.json"
+    assert sources["nvidia_developer"].platform == "nvidia_webinar"
+    assert sources["nvidia_developer"].max_pages == 1
+    assert sources["nvidia_developer"].max_detail_pages == 0
+
+
 def test_new_source_registration_exceptions_are_narrow_and_explicit():
     sources = {source.name: source for source in get_sources_registry().sources}
     assert sources["google_search_central"].allowed_registration_domains == [

@@ -15,10 +15,15 @@ form.addEventListener('submit', async event => {
   event.preventDefault();
   const params = new URLSearchParams(new FormData(form));
   [...params.keys()].forEach(key => { if (!params.get(key)) params.delete(key); });
-  const response = await fetch(`/api/events?${params}`);
-  const payload = await response.json();
   results.hidden = false;
-  container.innerHTML = payload.events.length ? payload.events.map(eventCard).join('') : '<p class="empty">No matching events.</p>';
+  try {
+    const response = await fetch(`/api/events?${params}`);
+    if (!response.ok) throw new Error('Could not load matching events. Check the filters and try again.');
+    const payload = await response.json();
+    container.innerHTML = payload.events.length ? payload.events.map(eventCard).join('') : '<p class="empty">No matching events.</p>';
+  } catch {
+    container.innerHTML = '<p class="empty" role="alert">Could not load matching events. Check the filters and try again.</p>';
+  }
   results.scrollIntoView({ behavior: 'smooth', block: 'start' });
 });
 form.addEventListener('reset', () => { results.hidden = true; container.innerHTML = ''; });

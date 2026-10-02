@@ -9,7 +9,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
 from sqlmodel import Session, select
 
 from eventfinder.config import (
@@ -25,6 +24,7 @@ from eventfinder.migrations import upgrade_database
 from eventfinder.models import SourceRun
 from eventfinder.repository import finish_source_run
 from eventfinder.service import DiscoveryService
+from eventfinder.urls import make_public_fetch_client
 
 
 @dataclass(frozen=True)
@@ -157,7 +157,7 @@ async def run_live_smoke(
             return Session(engine)
 
         observations: list[SourceObservation] = []
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        async with make_public_fetch_client(timeout=timeout) as client:
             discovery = DiscoveryService(
                 session_factory,
                 config,

@@ -58,13 +58,40 @@ The read-only interfaces are:
 
 No write HTTP routes or Telegram commands are exposed.
 
+Dashboard date filters cover whole days in IST, including the selected end day.
+The API also accepts timestamps with an explicit timezone for precise bounds.
+
+Priority-source health requires at least half of the enabled priority sources
+(rounded up) to have fresh successful runs. Freshness is measured against twice
+each source's configured cadence. The health response exposes the coverage
+counts and source states so one working source cannot hide a wider outage.
+
 ## Source behavior
 
-The 19 active curated sources cover Bengaluru communities (including GDG, FOSS United, Global AI, CNCF, and Atlassian), established discovery platforms, and official engineering calendars from Google, Databricks, AWS, Microsoft, NVIDIA, CNCF, and GitHub. They use public HTML/JSON-LD/OpenGraph metadata only; no privileged APIs are used. Eventbrite's public event-search API is retired, Meetup API access is restricted, and Luma's API has plan requirements.
+The 19 active curated sources cover Bengaluru communities (including GDG, FOSS United, Global AI, CNCF, and Atlassian), established discovery platforms, and official engineering calendars from Google, Databricks, AWS, Microsoft, NVIDIA, CNCF, and GitHub. They use public HTML, JSON feeds, JSON-LD, and OpenGraph metadata; no privileged APIs are used. Eventbrite's public event-search API is retired, Meetup API access is restricted, and Luma's API has plan requirements.
 
 Open Source India, Salesforce Developer Events, Docker Events, and Red Hat Summit Connect remain vetted but disabled source definitions: their current public pages do not expose a stable, bounded event-detail contract. They are deliberately excluded from active coverage until that changes, rather than treating arbitrary provider links or page prose as event facts.
 
 Listing-to-detail hydration is opt-in per source, uses only configured selectors/path prefixes, de-duplicates links, and has a small per-source cap. Every listing and detail request goes through the same URL/DNS safety, configured redirect boundary, robots, rate-limit, access-denial, and CAPTCHA checks. Registration links are never fetched; they are shown only when they pass URL safety and the source's separate registration-domain allowlist. A source failure is recorded individually, so a 403, CAPTCHA, 429, or markup change does not stop other sources; a 429 pauses the source rather than retrying it aggressively.
+
+Known-event refreshes retain the originating source's timezone, date convention,
+domain boundaries, and verified organizer attribution. They update only the
+known event. Incomplete dates remain unknown rather than borrowing a missing
+day from the current date.
+
+NVIDIA webinars use the public JSON feed linked by NVIDIA's portal script and
+the portal's published event routes. Feed timestamps and descriptions remain
+source evidence; an upcoming listing does not establish a free price or open
+registration. Refresh reads the feed and updates only the matching known event.
+
+Both the service and live smoke checks pin public-source connections to validated
+public IP addresses. A network that resolves a source to a non-public address
+will leave that source unavailable until public DNS resolution is restored.
+
+Digest retries retain their saved message bodies and track which event changes
+each chunk contains. If retries are exhausted, a later digest carries only the
+unsent chunks; successfully delivered chunks remain complete. Cancellation and
+other terminal registration states are stated explicitly in notifications.
 
 ## Verification
 

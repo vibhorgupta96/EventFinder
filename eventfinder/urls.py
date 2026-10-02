@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import socket
 from collections.abc import Awaitable, Callable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -21,6 +22,23 @@ Resolver = Callable[[str], Awaitable[list[str]]]
 # distinct destination or fact; stripping them lets cross-posted links that
 # differ solely by tracking params dedupe to the same canonical event.
 _TRACKING_QUERY_KEYS = frozenset({"fbclid", "gclid", "mc_eid", "igshid"})
+_MEETUP_TRACKING_QUERY_KEYS = frozenset({"recid", "recsource", "searchid", "eventorigin"})
+_MEETUP_EVENT_PATH = re.compile(r"^/(?:[^/]+/)?events/[^/]+/?$")
+_NVIDIA_WEBINAR_ROUTE = re.compile(r"/webinar/[0-9]+")
+
+
+def _event_route_fragment(parsed: SplitResult) -> str:
+    """Keep the published NVIDIA portal's event route, not ordinary anchors."""
+
+    if (
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").casefold() == "www.nvidia.com"
+        and parsed.port in {None, 443}
+        and parsed.path == "/en-us/about-nvidia/webinar-portal/"
+        and _NVIDIA_WEBINAR_ROUTE.fullmatch(parsed.fragment)
+    ):
+        return parsed.fragment
+    return ""
 
 
 def _is_public_ip(value: str) -> bool:
@@ -55,11 +73,13 @@ def validate_url_syntax(url: str) -> str:
     if hostname == "localhost" or hostname.endswith(".localhost"):
         raise UnsafeURL("localhost URLs are not allowed")
     try:
-        if not _is_public_ip(hostname):
-            raise UnsafeURL("non-public IP URL is not allowed")
+        literal = ipaddress.ip_address(hostname)
     except ValueError:
         pass
-    return urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path or "/", parsed.query, ""))
+    else:
+        if not _is_public_ip(str(literal)):
+            raise UnsafeURL("non-public IP URL is not allowed")
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path or "/", parsed.query, _event_route_fragment(parsed)))
 
 
 def normalize_url(url: str) -> str:
@@ -74,13 +94,65 @@ def normalize_url(url: str) -> str:
     validated = validate_url_syntax(url)
     parsed = urlsplit(validated)
     hostname = (parsed.hostname or "").casefold()
-    netloc = f"{hostname}:{parsed.port}" if parsed.port else hostname
+    netloc = f"[{hostname}]" if ":" in hostname else hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
     kept_params = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
         if not key.casefold().startswith("utm_") and key.casefold() not in _TRACKING_QUERY_KEYS
     ]
-    return urlunsplit((parsed.scheme, netloc, parsed.path or "/", urlencode(kept_params), ""))
+    return urlunsplit((parsed.scheme, netloc, parsed.path or "/", urlencode(kept_params), _event_route_fragment(parsed)))
+
+
+def meetup_event_identity_url(url: str) -> str | None:
+    """Compare Meetup event URLs without recommendation query parameters.
+
+    This is an identity key only. The observed canonical and source URLs stay
+    intact for outbound links and provenance.
+    """
+
+    try:
+        parsed = urlsplit(normalize_url(url))
+    except UnsafeURL:
+        return None
+    if parsed.hostname not in {"meetup.com", "www.meetup.com"} or not _MEETUP_EVENT_PATH.fullmatch(parsed.path):
+        return None
+    kept_params = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.casefold() not in _MEETUP_TRACKING_QUERY_KEYS
+    ]
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), urlencode(kept_params), ""))
+
+
+def nvidia_webinar_identity_url(url: str) -> str | None:
+    """Return an identity only for the portal's published numeric event route."""
+
+    try:
+        normalized = normalize_url(url)
+    except UnsafeURL:
+        return None
+    return normalized if _event_route_fragment(urlsplit(normalized)) else None
+
+
+def event_identity_url(url: str) -> str:
+    """Return a conservative identity key for same-fetch event deduplication."""
+
+    if meetup_identity := meetup_event_identity_url(url):
+        return meetup_identity
+    try:
+        return normalize_url(url)
+    except UnsafeURL:
+        # Parsing can precede URLSafety's explicit rejection at the fetch
+        # boundary; identity comparison must not make one bad item fail a page.
+        return url
+
+
+def same_event_destination(first: str | None, second: str | None) -> bool:
+    """Match two present event links after only known tracking is removed."""
+
+    return bool(first and second) and event_identity_url(first) == event_identity_url(second)
 
 
 async def default_resolver(hostname: str) -> list[str]:
@@ -109,10 +181,11 @@ async def _resolve_public_ip(hostname: str, resolver: Resolver) -> str:
         raise UnsafeURL("DNS returned no addresses") from None
     for address in addresses:
         try:
-            if not _is_public_ip(address):
-                raise UnsafeURL("DNS resolved to a non-public address") from None
+            parsed_address = ipaddress.ip_address(address)
         except ValueError as error:
             raise UnsafeURL("DNS returned an invalid address") from error
+        if not _is_public_ip(str(parsed_address)):
+            raise UnsafeURL("DNS resolved to a non-public address") from None
     return addresses[0]
 
 
@@ -165,14 +238,26 @@ class URLSafeTransport(httpx.AsyncBaseTransport):
         # ":port". Reconstruct the host(:port) httpx would itself have
         # generated for the original URL; SNI stays hostname-only.
         original_port = request.url.port
+        host_header = f"[{original_host}]" if ":" in original_host else original_host
         pinned_request.headers["Host"] = (
-            f"{original_host}:{original_port}" if original_port else original_host
+            f"{host_header}:{original_port}" if original_port else host_header
         )
         pinned_request.extensions["sni_hostname"] = original_host
         return await self.inner.handle_async_request(pinned_request)
 
     async def aclose(self) -> None:
         await self.inner.aclose()
+
+
+def make_public_fetch_client(timeout: float | httpx.Timeout = 20.0) -> httpx.AsyncClient:
+    """Create a DNS-pinned client without cross-origin connection reuse."""
+
+    transport = URLSafeTransport(
+        inner=httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=0)
+        )
+    )
+    return httpx.AsyncClient(transport=transport, timeout=timeout)
 
 
 def safe_outbound_url(url: str | None) -> str | None:

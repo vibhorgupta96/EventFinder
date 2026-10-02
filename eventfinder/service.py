@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 import httpx
 from loguru import logger
@@ -13,7 +14,7 @@ from sqlmodel import Session, select
 from eventfinder.ai import AIClassifier
 from eventfinder.config import FileConfig, OrganizersRegistry, SourceDefinition, SourcesRegistry
 from eventfinder.domain import EventCandidate
-from eventfinder.models import Event, SourceRun
+from eventfinder.models import Event, EventSource, SourceRun
 from eventfinder.policy import assess_candidate
 from eventfinder.repository import (
     expire_past_events,
@@ -23,7 +24,13 @@ from eventfinder.repository import (
     upsert_candidate,
 )
 from eventfinder.sources import RequestLimiter, RobotsPolicy, SourceFetchError, make_source
-from eventfinder.urls import URLSafety
+from eventfinder.urls import (
+    UnsafeURL,
+    URLSafety,
+    nvidia_webinar_identity_url,
+    same_event_destination,
+    validate_url_syntax,
+)
 
 
 def _detail_hydration_error(result) -> tuple[str | None, int]:
@@ -40,6 +47,50 @@ def _detail_hydration_error(result) -> tuple[str | None, int]:
     rendered = "; ".join(f"{count} {reason}" for reason, count in sorted(counts.items()))
     pages = "page" if len(reasons) == 1 else "pages"
     return f"detail hydration rejected {len(reasons)} {pages}: {rendered}", len(reasons)
+
+
+def _source_domains(definition: SourceDefinition, *, registration: bool = False) -> set[str]:
+    hostname = urlsplit(definition.url).hostname if definition.url else None
+    if registration:
+        owned = {hostname.casefold()} if hostname else set(definition.allowed_domains)
+        return owned | set(definition.allowed_registration_domains)
+    return set(definition.allowed_domains) | ({hostname.casefold()} if hostname else set())
+
+
+def _within_source(url: str, domains: set[str]) -> bool:
+    try:
+        hostname = urlsplit(validate_url_syntax(url)).hostname or ""
+    except UnsafeURL:
+        return False
+    return any(hostname.casefold() == domain or hostname.casefold().endswith(f".{domain}") for domain in domains)
+
+
+def _observed_event_provenance(source: EventSource, definition: SourceDefinition, canonical_url: str) -> bool:
+    parser = source.evidence.get("parser")
+    if source.evidence.get("rejected"):
+        return False
+    if definition.platform == "nvidia_webinar" or parser == "nvidia_webinar_feed":
+        portal_identity = nvidia_webinar_identity_url(canonical_url)
+        portal = urlsplit(portal_identity) if portal_identity else None
+        webinar_id = portal.fragment.removeprefix("/webinar/") if portal else None
+        observed_event = source.evidence.get("event")
+        return (
+            parser == "nvidia_webinar_feed"
+            and definition.platform == "nvidia_webinar"
+            and definition.url == "https://www.nvidia.com/content/dam/en-zz/Solutions/about-nvidia/webinar/webinarJSONData.json"
+            and source.source_url == definition.url
+            and portal is not None
+            and not portal.query
+            and webinar_id is not None
+            and int(webinar_id) > 0
+            and source.raw_id == webinar_id
+            and isinstance(observed_event, dict)
+            and str(observed_event.get("eventId")) == webinar_id
+        )
+    return isinstance(parser, str) and (
+        parser in {"json_ld", "embedded_json", "opengraph"}
+        or parser.endswith((":semantic_labels", ":html"))
+    )
 
 
 class DiscoveryService:
@@ -200,35 +251,81 @@ class DiscoveryService:
                     .limit(limit)
                 ).all()
             )
-        refreshed = errors = 0
+            provenance = {
+                event.id: list(session.exec(select(EventSource).where(EventSource.event_id == event.id)).all())
+                for event in events
+            }
+        definitions = {source.name: source for source in self.sources.sources if source.enabled}
+        refreshed = errors = skipped = 0
         for event in events:
             visibility_end = event.ends_at or event.starts_at
             if visibility_end and (
                 visibility_end.replace(tzinfo=UTC) if visibility_end.tzinfo is None else visibility_end.astimezone(UTC)
             ) < now:
                 continue
-            definition = SourceDefinition(
-                name="known_event_refresh",
-                adapter="public_page",
-                url=event.canonical_url,
-                enabled=True,
-                cadence_hours=3,
-                rate_limit_seconds=1,
+            attributed_sources = sorted(
+                provenance[event.id],
+                key=lambda source: ({"low": 0, "medium": 1, "high": 2}.get(source.evidence.get("organizer_trust"), 0), source.observed_at),
+                reverse=True,
             )
+            original = next((
+                definitions[source.source_name]
+                for source in attributed_sources
+                if source.source_name in definitions
+                and _observed_event_provenance(source, definitions[source.source_name], event.canonical_url)
+                and _within_source(source.source_url, _source_domains(definitions[source.source_name]))
+                and _within_source(event.canonical_url, _source_domains(definitions[source.source_name]))
+            ), None)
+            if original is None:
+                logger.info("Skipping refresh without verified source provenance: {}", event.canonical_url)
+                skipped += 1
+                continue
+            # Preserve source identity, parsing conventions and boundaries;
+            # refreshing one event must not crawl its related-event links.
+            # NVIDIA's verified HashRouter identities exist only in its feed;
+            # refetch that configured feed and filter to this event below.
+            definition = SourceDefinition.model_validate({
+                **original.model_dump(),
+                "adapter": "public_page",
+                "url": original.url if original.platform == "nvidia_webinar" else event.canonical_url,
+                "query": None,
+                "allowed_domains": sorted(_source_domains(original)),
+                "allowed_registration_domains": sorted(_source_domains(original, registration=True)),
+                "max_pages": 1,
+                "pagination_param": None,
+                "detail_link_prefixes": [],
+                "detail_link_selectors": [],
+                "max_detail_pages": 0,
+            })
             try:
-                result = await make_source(
+                source = make_source(
                     definition,
                     self.client,
                     self.robots_policy,
                     self.safety,
                     self.limiter,
-                ).fetch()
+                )
+                # A permitted redirect host is not automatically a permitted
+                # registration host merely because it is the refreshed URL.
+                source.allowed_registration_domains = _source_domains(original, registration=True)
+                result = await source.fetch()
             except (SourceFetchError, httpx.HTTPError, ValueError) as error:
                 logger.info("Could not refresh {}: {}", event.canonical_url, error)
                 errors += 1
                 continue
+            matching = [candidate for candidate in result.candidates if same_event_destination(candidate.canonical_url, event.canonical_url)]
+            if not matching:
+                skipped += 1
+                continue
             with self.session_factory() as session:
-                for candidate in result.candidates:
-                    await self._persist_candidate(session, candidate)
-            refreshed += 1
-        return {"refreshed": refreshed, "errors": errors}
+                persisted = False
+                for candidate in matching:
+                    existing = find_existing(session, candidate)
+                    if existing is not None and existing.id == event.id:
+                        await self._persist_candidate(session, candidate)
+                        persisted = True
+            if persisted:
+                refreshed += 1
+            else:
+                skipped += 1
+        return {"refreshed": refreshed, "errors": errors, "skipped": skipped}

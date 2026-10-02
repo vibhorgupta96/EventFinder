@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from math import ceil
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -30,10 +32,29 @@ from eventfinder.repository import list_events, source_health
 from eventfinder.scheduler import EventFinderScheduler
 from eventfinder.service import DiscoveryService
 from eventfinder.telegram import make_digest_service
-from eventfinder.urls import URLSafeTransport, safe_outbound_url
+from eventfinder.urls import make_public_fetch_client, safe_outbound_url
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
+
+
+def _date_bound(value: str | None, *, end_of_day: bool = False) -> tuple[datetime | None, bool]:
+    """Date controls cover whole IST days; timestamps must state their timezone."""
+
+    if value is None:
+        return None, False
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            day = date.fromisoformat(value)
+            if end_of_day:
+                day += timedelta(days=1)
+            return datetime.combine(day, time.min, ZoneInfo("Asia/Kolkata")).astimezone(UTC), end_of_day
+        timestamp = datetime.fromisoformat(value)
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("timestamp needs a timezone")
+        return timestamp.astimezone(UTC), False
+    except (ValueError, OverflowError) as error:
+        raise HTTPException(status_code=422, detail="Date filters require YYYY-MM-DD or an ISO timestamp with timezone") from error
 
 
 def _ist_display(value: datetime | None) -> str | None:
@@ -108,23 +129,7 @@ def create_app(
     # need DNS pinning; only discovery fetches arbitrary public-source URLs
     # and therefore gets the SSRF-hardened, DNS-pinned transport.
     http_client = client or httpx.AsyncClient(timeout=httpx.Timeout(20.0))
-    # URLSafeTransport pins every request's connection to a validated IP, but
-    # httpcore keys keepalive pool reuse by (scheme, host, port) using that
-    # pinned IP and ignores the `sni_hostname` extension. Two distinct source
-    # hostnames that share an IP (e.g. behind a common CDN) could otherwise
-    # have a keepalive TLS connection negotiated/verified for host A reused
-    # for a request to host B, letting B ride a TLS channel authenticated for
-    # A. Disabling keepalive reuse forces a fresh, freshly-verified
-    # connection per request instead. This must be applied to the transport
-    # actually performing the pinned request (URLSafeTransport's inner
-    # transport) since passing `limits=` to AsyncClient has no effect once a
-    # custom `transport=` is supplied.
-    discovery_limits = httpx.Limits(max_connections=20, max_keepalive_connections=0)
-    discovery_client = fetch_client or httpx.AsyncClient(
-        transport=URLSafeTransport(inner=httpx.AsyncHTTPTransport(limits=discovery_limits)),
-        timeout=httpx.Timeout(20.0),
-        limits=discovery_limits,
-    )
+    discovery_client = fetch_client or make_public_fetch_client(timeout=httpx.Timeout(20.0))
 
     def session_factory() -> Session:
         return Session(engine)
@@ -187,10 +192,12 @@ def create_app(
         format: str | None = None,
         registration_state: str | None = None,
         source: str | None = None,
-        start_after: datetime | None = None,
-        start_before: datetime | None = None,
+        start_after: str | None = None,
+        start_before: str | None = None,
         status: str | None = Query(default=None, pattern="^(eligible|needs_review)$"),
     ):
+        after, _ = _date_bound(start_after)
+        before, before_exclusive = _date_bound(start_before, end_of_day=True)
         with session_factory() as session:
             events = list_events(
                 session,
@@ -201,8 +208,9 @@ def create_app(
                 event_format=format,
                 registration_state=registration_state,
                 source=source,
-                start_after=start_after,
-                start_before=start_before,
+                start_after=after,
+                start_before=before,
+                start_before_exclusive=before_exclusive,
                 status=status,
                 limit=file_config.policy.dashboard_limit,
             )
@@ -228,27 +236,35 @@ def create_app(
                 status_code=503,
                 content={"status": "degraded", "database": "error", "scheduler": scheduler.running},
             )
-        priority_names = {source.name for source in sources.sources if source.priority and source.enabled}
-        fresh_priority = {
-            item["source_name"]
-            for item in health
-            if item["source_name"] in priority_names
-            and item["status"] == "ok"
-            and item["last_finished_at"]
-            and (
-                item["last_finished_at"].replace(tzinfo=UTC)
-                if item["last_finished_at"].tzinfo is None
-                else item["last_finished_at"].astimezone(UTC)
-            )
-            >= now - timedelta(hours=file_config.scheduler.discovery_hours * 2)
-        }
-        healthy = scheduler.running and bool(fresh_priority)
+        priority_sources = [source for source in sources.sources if source.priority and source.enabled]
+        by_name = {item["source_name"]: item for item in health}
+        priority_state = []
+        for source in priority_sources:
+            item = by_name.get(source.name)
+            finished_at = item["last_finished_at"] if item else None
+            if finished_at:
+                finished_at = finished_at.replace(tzinfo=UTC) if finished_at.tzinfo is None else finished_at.astimezone(UTC)
+            state = "missing" if item is None else item["status"]
+            if item and item["status"] == "ok":
+                state = "fresh" if finished_at and finished_at >= now - timedelta(hours=source.cadence_hours * 2) else "stale"
+            priority_state.append({
+                "source_name": source.name,
+                "state": state,
+                "cadence_hours": source.cadence_hours,
+                "freshness_hours": source.cadence_hours * 2,
+                "last_finished_at": finished_at.isoformat() if finished_at else None,
+            })
+        fresh_priority = sum(item["state"] == "fresh" for item in priority_state)
+        required_priority = max(1, ceil(len(priority_sources) / 2))
+        healthy = scheduler.running and fresh_priority >= required_priority
         payload = {
             "status": "ok" if healthy else "degraded",
             "database": "ok",
             "scheduler": scheduler.running,
-            "priority_sources_fresh": len(fresh_priority),
-            "priority_sources_total": len(priority_names),
+            "priority_sources_fresh": fresh_priority,
+            "priority_sources_total": len(priority_sources),
+            "priority_sources_required": required_priority,
+            "priority_sources": priority_state,
         }
         return payload if healthy else JSONResponse(status_code=503, content=payload)
 

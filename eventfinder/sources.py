@@ -7,7 +7,7 @@ import json
 import re
 import time
 from abc import ABC, abstractmethod
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
@@ -30,7 +30,7 @@ from eventfinder.domain import (
     has_explicit_paid_price,
     normalize_price,
 )
-from eventfinder.urls import UnsafeURL, URLSafety, validate_url_syntax
+from eventfinder.urls import UnsafeURL, URLSafety, event_identity_url, validate_url_syntax
 
 USER_AGENT = "EventFinder/0.1 (+local read-only technical event discovery)"
 ROBOTS_TTL = timedelta(hours=6)
@@ -45,6 +45,7 @@ MAX_REDIRECTS = 5
 # read, which also caps inflated (gzip/deflate/br) payload sizes.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_ROBOTS_BYTES = 512 * 1024
+NVIDIA_WEBINAR_PORTAL_URL = "https://www.nvidia.com/en-us/about-nvidia/webinar-portal/"
 PLATFORM_CARD_SELECTORS = {
     "luma": "[data-event], [class*='event-card'], a[href*='/event/']",
     "meetup": "[data-event-id], [data-testid*='event'], [class*='event-card']",
@@ -89,7 +90,27 @@ def _allowed_destination(url: str, allowed_domains: set[str] | None) -> bool:
 
 
 def _is_interstitial(text: str) -> bool:
-    return bool(re.search(r"captcha|verify you are human|access denied|checking your browser", text, re.I))
+    soup = BeautifulSoup(text, "html.parser")
+    # Shared bundles and feature flags commonly mention CAPTCHA even on
+    # normal event calendars. Only inspect content a visitor can see.
+    for node in soup.select("script, style, template, [hidden], [aria-hidden='true']"):
+        node.decompose()
+    for node in list(soup.select("[style]")):
+        if node.attrs is not None and re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", node.get("style", ""), re.I):
+            node.decompose()
+    visible_text = soup.get_text(" ", strip=True)
+    if re.search(
+        r"\b(?:verify (?:that )?you are human|access denied|checking your browser"
+        r"|(?:complete|solve|enter)\s+(?:(?:the|a)\s+)?captcha"
+        r"|captcha\s+(?:challenge|verification|required))\b",
+        visible_text,
+        re.I,
+    ):
+        return True
+    if any(re.fullmatch(r"\s*(?:re)?captcha\s*", node.get_text(" ", strip=True), re.I) for node in soup.select("title, h1, h2")):
+        return True
+    # A rendered challenge widget may have no text until its iframe loads.
+    return bool(soup.select_one(".g-recaptcha, .h-captcha, iframe[src*='/recaptcha/'], iframe[src*='hcaptcha.com']"))
 
 
 class EventSource(ABC):
@@ -742,28 +763,32 @@ def _registration_state(text: str) -> RegistrationState:
 
 def _offer_values(
     offers: Any, tz: str = "Asia/Kolkata"
-) -> tuple[str | None, str | None, str | None, datetime | None]:
+) -> tuple[str | None, str | None, str | None, datetime | None, bool]:
     prices: list[str] = []
     registration_url: str | None = None
     availability: str | None = None
     valid_from: datetime | None = None
+    has_paid_offer = False
     for offer in _as_list(offers):
         if isinstance(offer, (str, int, float)) and not isinstance(offer, bool):
             if price := normalize_price(offer):
                 prices.append(price)
+                has_paid_offer = has_paid_offer or has_explicit_paid_price(price)
             continue
         if not isinstance(offer, dict):
             continue
         price = normalize_price(_first_present(offer, "price", "amount", "fee"))
         currency = _text(offer.get("priceCurrency") or offer.get("currency"))
         if price:
-            prices.append(f"{currency or ''} {price}".strip())
+            offer_price = f"{currency or ''} {price}".strip()
+            prices.append(offer_price)
+            has_paid_offer = has_paid_offer or has_explicit_paid_price(price) or has_explicit_paid_price(offer_price)
         registration_url = registration_url or _text(offer.get("url") or offer.get("checkoutUrl"))
         availability = availability or _text(offer.get("availability"))
         valid_from = valid_from or _parse_time(offer.get("validFrom"), tz)
     # A multi-tier offer may include free admission and a paid pass/workshop.
     # Retain every explicitly displayed price so policy can reject any paid tier.
-    return "; ".join(dict.fromkeys(prices)) or None, registration_url, availability, valid_from
+    return "; ".join(dict.fromkeys(prices)) or None, registration_url, availability, valid_from, has_paid_offer
 
 
 def _schema_registration_state(event_status: Any, availability: str | None) -> RegistrationState:
@@ -844,7 +869,7 @@ def _candidate_from_mapping(
     venue, city, country = _location(
         node.get("location") or node.get("venue") or node.get("geo_address_info") or {"city": node.get("city")}
     )
-    price, offer_url, offer_availability, offer_valid_from = _offer_values(
+    price, offer_url, offer_availability, offer_valid_from, has_paid_offer = _offer_values(
         node.get("offers") or node.get("ticket") or node.get("pricing") or node.get("tickets"), tz
     )
     price = price or normalize_price(_first_present(node, "price", "fee", "price_text"))
@@ -867,7 +892,7 @@ def _candidate_from_mapping(
             ],
         )
     )
-    evidence = SourceEvidence(source_name=source_name, source_url=page_url, observed_at=observed_at, raw_id=_text(node.get("@id") or node.get("id")), facts={"parser": parser_name, "event": node})
+    evidence = SourceEvidence(source_name=source_name, source_url=page_url, observed_at=observed_at, raw_id=_text(node.get("@id") or node.get("id")), facts={"parser": parser_name, "event": node, "source_timezone": tz})
     schema_state = _schema_registration_state(node.get("eventStatus"), offer_availability)
     parsed_state = _registration_state(explicit_registration_status) if explicit_registration_status else _registration_state(state_text)
     return EventCandidate(
@@ -880,7 +905,7 @@ def _candidate_from_mapping(
         ), registration_url=urljoin(page_url, registration_url),
         registration_deadline=_parse_time(node.get("registrationDeadline") or node.get("registration_deadline") or node.get("registration_closes_at") or node.get("applicationDeadline") or node.get("deadline"), tz),
         registration_opened_at=_parse_time(node.get("registrationOpenedAt") or node.get("registration_opened_at") or node.get("registration_opened") or node.get("registrationOpenDate") or node.get("registrationDate"), tz) or offer_valid_from,
-        price_text=price, is_explicitly_paid=_is_paid(price), eligibility_text=eligibility, speakers=speakers,
+        price_text=price, is_explicitly_paid=has_paid_offer or _is_paid(price), eligibility_text=eligibility, speakers=speakers,
         topics=[topic for topic in _as_list(node.get("topics") or node.get("tags") or node.get("categories")) if isinstance(topic, str)], evidence=evidence,
     )
 
@@ -951,10 +976,12 @@ _MONTH_NAME_PATTERN = re.compile(
     r"|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
     re.I,
 )
-# A day/month numeric token, e.g. the "10-10" in "2026-10-10" or "05/03" in
-# "05/03/2026". This is deliberately loose: it only gates whether the text
-# carries a real date beyond a bare year, never the value that gets parsed.
-_NUMERIC_DATE_TOKEN_PATTERN = re.compile(r"\d{1,2}[/-]\d{1,2}")
+_YEAR_LAST_NUMERIC_DATE_PATTERN = re.compile(r"\b\d{1,2}[-/]\d{1,2}[-/]20\d{2}\b")
+_NAMED_MONTH_DAY_PATTERN = re.compile(
+    rf"(?:\b\d{{1,2}}(?:st|nd|rd|th)?[\s,/-]+{_MONTH_NAME_PATTERN.pattern}"
+    rf"|{_MONTH_NAME_PATTERN.pattern}[\s,/-]+\d{{1,2}}(?:st|nd|rd|th)?(?!\d))",
+    re.I,
+)
 # An explicit year-first numeric date (e.g. "2026-10-11") is already
 # unambiguous: the two-digit fields that follow are month-then-day. The
 # source's dayfirst preference must only disambiguate genuinely ambiguous,
@@ -968,7 +995,11 @@ def _label_time(value: str | None, tz: str = "Asia/Kolkata", dayfirst: bool = Tr
 
     if not value or not re.search(r"\b20\d{2}\b", value):
         return None
-    if not (_MONTH_NAME_PATTERN.search(value) or _NUMERIC_DATE_TOKEN_PATTERN.search(value)):
+    if not (
+        _NAMED_MONTH_DAY_PATTERN.search(value)
+        or _YEAR_FIRST_NUMERIC_DATE_PATTERN.search(value)
+        or _YEAR_LAST_NUMERIC_DATE_PATTERN.search(value)
+    ):
         return None
     effective_dayfirst = False if _YEAR_FIRST_NUMERIC_DATE_PATTERN.search(value) else dayfirst
     try:
@@ -1080,6 +1111,8 @@ def parse_event_page(
 ) -> list[EventCandidate]:
     """Extract JSON-LD, embedded public JSON, and platform card markup without invented facts."""
     observed_at = observed_at or datetime.now(UTC)
+    if platform == "nvidia_webinar":
+        return _nvidia_webinar_candidates(html, page_url, source_name, observed_at)
     soup = BeautifulSoup(html, "html.parser")
     candidates: list[EventCandidate] = []
     for script in soup.select("script[type='application/ld+json'], script[type='application/json'], script#__NEXT_DATA__"):
@@ -1108,6 +1141,109 @@ def parse_event_page(
     evidence_text = " ".join(filter(None, [title, description, soup.get_text(" ", strip=True)]))[:3000]
     evidence = SourceEvidence(source_name=source_name, source_url=page_url, observed_at=observed_at, facts={"parser": "opengraph", "title": title, "description": description})
     return [EventCandidate(title=title, canonical_url=urljoin(page_url, canonical_url), source_url=page_url, source_name=source_name, description=description, event_type=_event_type(title, description), registration_state=_registration_state(evidence_text), evidence=evidence)]
+
+
+def _utc_epoch_milliseconds(value: Any) -> datetime | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _nvidia_displayed_start(value: Any) -> datetime | None:
+    """Parse only complete portal dates with a published, explicit fixed zone."""
+
+    if not isinstance(value, str) or not re.search(r"\b20\d{2}\b", value):
+        return None
+    if not (
+        _NAMED_MONTH_DAY_PATTERN.search(value)
+        or _YEAR_FIRST_NUMERIC_DATE_PATTERN.search(value)
+        or _YEAR_LAST_NUMERIC_DATE_PATTERN.search(value)
+    ):
+        return None
+    zone = re.search(r"\b(CET|PST)\s*$", value, re.I)
+    if not zone or not re.search(r"\b\d{1,2}(?::\d{2}|\s*(?:AM|PM)\b)", value, re.I):
+        return None
+    normalized = value[: zone.start()] + zone.group(1).upper()
+    try:
+        parsed = date_parser.parse(
+            normalized,
+            tzinfos={"CET": timezone(timedelta(hours=1)), "PST": timezone(timedelta(hours=-8))},
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+
+
+def _nvidia_webinar_candidates(
+    text: str, page_url: str, source_name: str, observed_at: datetime
+) -> list[EventCandidate]:
+    """Read the public portal's feed and its published numeric HashRouter route."""
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return []
+    candidates = []
+    for row in payload["data"]:
+        if not isinstance(row, dict) or row.get("type") != "Upcoming":
+            continue
+        event_id = row.get("eventId")
+        if isinstance(event_id, bool) or not isinstance(event_id, (int, str)):
+            continue
+        if not re.fullmatch(r"[0-9]+", str(event_id)) or not str(event_id).strip("0"):
+            continue
+        title = _text(row.get("title"))
+        if not title:
+            continue
+        live_start = _utc_epoch_milliseconds(row.get("liveStartTimeInUTC"))
+        has_displayed_date = row.get("eventStartDate") is not None and row.get("eventStartDate") != ""
+        starts_at = _nvidia_displayed_start(row.get("eventStartDate")) if has_displayed_date else live_start
+        ends_at = _utc_epoch_milliseconds(row.get("liveEndTimeInUTC"))
+        if starts_at is None or (ends_at is not None and ends_at < starts_at):
+            ends_at = None
+        description = BeautifulSoup(_text(row.get("eventAbstract")) or "", "html.parser").get_text(" ", strip=True) or None
+        canonical_url = f"{NVIDIA_WEBINAR_PORTAL_URL}#/webinar/{event_id}"
+        evidence = SourceEvidence(
+            source_name=source_name,
+            source_url=page_url,
+            observed_at=observed_at,
+            raw_id=str(event_id),
+            facts={
+                "parser": "nvidia_webinar_feed",
+                "event": row,
+                "source_timezone": "UTC",
+                "portal_url": NVIDIA_WEBINAR_PORTAL_URL,
+                "portal_route": "/webinar/:webinarId",
+                "scheduled_start_field": "eventStartDate" if has_displayed_date else "liveStartTimeInUTC",
+            },
+        )
+        if has_displayed_date and starts_at is None:
+            evidence.facts["start_time_error"] = "displayed eventStartDate has no complete date with a recognized explicit timezone"
+        if has_displayed_date and starts_at is not None and live_start is not None and starts_at != live_start:
+            evidence.facts["start_time_disagreement"] = {
+                "displayed_start": starts_at.isoformat(),
+                "live_start": live_start.isoformat(),
+            }
+        candidates.append(
+            EventCandidate(
+                title=title,
+                canonical_url=canonical_url,
+                source_url=page_url,
+                source_name=source_name,
+                description=description,
+                starts_at=starts_at,
+                ends_at=ends_at,
+                format=EventFormat.ONLINE if row.get("mediaType") == "Webcast" else EventFormat.UNKNOWN,
+                event_type=_event_type(title, description or ""),
+                evidence=evidence,
+            )
+        )
+    return _dedupe_candidates(candidates)
 
 
 _REGISTRATION_STATE_SEVERITY = {
@@ -1190,6 +1326,27 @@ def _explicit_json_ld_format(candidate: EventCandidate) -> EventFormat | None:
     return None
 
 
+def _explicit_json_ld_time(candidate: EventCandidate, field: str) -> datetime | None:
+    """Use event-specific schema dates ahead of page-wide semantic labels."""
+
+    for observation in reversed(_flattened_observations(candidate.evidence)):
+        facts = observation.get("facts", {})
+        if not isinstance(facts, dict) or facts.get("parser") != "json_ld":
+            continue
+        event = facts.get("event")
+        if not isinstance(event, dict) or not event.get(field):
+            continue
+        raw_value = event[field]
+        # A schema calendar date parses as midnight, but cannot override a
+        # semantic label that supplies the event's actual clock time.
+        if not isinstance(raw_value, str) or not re.search(r"\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}", raw_value):
+            continue
+        parsed = _parse_time(raw_value, facts.get("source_timezone", "Asia/Kolkata"))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _merge_candidates(existing: EventCandidate, candidate: EventCandidate) -> EventCandidate:
     """Merge complementary observations without weakening policy-relevant facts."""
 
@@ -1198,8 +1355,18 @@ def _merge_candidates(existing: EventCandidate, candidate: EventCandidate) -> Ev
     merged.source_url = candidate.source_url or existing.source_url
     merged.organizer = candidate.organizer or existing.organizer
     merged.description = _combined_text(existing.description, candidate.description)
-    merged.starts_at = candidate.starts_at or existing.starts_at
-    merged.ends_at = candidate.ends_at or existing.ends_at
+    merged.starts_at = (
+        _explicit_json_ld_time(candidate, "startDate")
+        or _explicit_json_ld_time(existing, "startDate")
+        or candidate.starts_at
+        or existing.starts_at
+    )
+    merged.ends_at = (
+        _explicit_json_ld_time(candidate, "endDate")
+        or _explicit_json_ld_time(existing, "endDate")
+        or candidate.ends_at
+        or existing.ends_at
+    )
     merged.venue = candidate.venue or existing.venue
     merged.city = candidate.city or existing.city
     merged.country = candidate.country or existing.country
@@ -1243,8 +1410,9 @@ def _merge_candidates(existing: EventCandidate, candidate: EventCandidate) -> Ev
 def _dedupe_candidates(candidates: list[EventCandidate]) -> list[EventCandidate]:
     deduped: dict[str, EventCandidate] = {}
     for candidate in candidates:
-        existing = deduped.get(candidate.canonical_url)
-        deduped[candidate.canonical_url] = (
+        identity = event_identity_url(candidate.canonical_url)
+        existing = deduped.get(identity)
+        deduped[identity] = (
             candidate if existing is None else _merge_candidates(existing, candidate)
         )
     return list(deduped.values())

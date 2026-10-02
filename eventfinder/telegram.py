@@ -13,7 +13,7 @@ from sqlmodel import Session, select
 from eventfinder.config import Settings
 from eventfinder.models import DigestDelivery, DigestRun, Event, EventChange, utcnow
 from eventfinder.repository import mark_changes_digested, pending_changes
-from eventfinder.urls import safe_outbound_url
+from eventfinder.urls import safe_outbound_url, same_event_destination
 
 IST = ZoneInfo("Asia/Kolkata")
 TELEGRAM_SAFE_LIMIT = 4000
@@ -88,6 +88,8 @@ def _format_event(event: Event, changes: list[EventChange]) -> str:
     venue = _capped(event.venue or event.city, 200)
     price_text = _capped(event.price_text, 120)
     lines = [f"• {title}", f"  {_time(event.starts_at)} · {event.format.replace('_', ' ')}"]
+    if event.registration_state != "unknown":
+        lines.append(f"  Registration: {event.registration_state.replace('_', ' ')}")
     if venue:
         lines.append(f"  {venue}")
     if event.registration_deadline:
@@ -120,6 +122,51 @@ def split_message(text: str, limit: int = TELEGRAM_SAFE_LIMIT) -> list[str]:
         current = block
     if current:
         chunks.append(current)
+    return chunks
+
+
+def _digest_chunks(grouped: list[tuple[Event, list[EventChange]]]) -> list[tuple[str, list[int]]]:
+    """Split a digest while retaining the changes present in each chunk."""
+
+    header = "EventFinder: new or changed technical events"
+    rendered: list[str] = []
+    spans: list[tuple[int, int, set[int]]] = []
+    offset = len(header) + 2
+    for event, changes in grouped:
+        body = _format_event(event, changes)
+        ids = {change.id for change in changes if change.id is not None}
+        spans.append((offset, offset + len(body), ids))
+        rendered.append(body)
+        offset += len(body) + 2
+
+    text = header + "\n\n" + "\n\n".join(rendered)
+    blocks: list[tuple[str, set[int]]] = []
+    offset = 0
+    for block in text.split("\n\n"):
+        end = offset + len(block)
+        ids = set().union(*(change_ids for start, stop, change_ids in spans if start < end and stop > offset))
+        blocks.append((block, ids))
+        offset = end + 2
+
+    chunks: list[tuple[str, list[int]]] = []
+    current, current_ids = "", set()
+    for original, ids in blocks:
+        block = original
+        proposed = f"{current}\n\n{block}".strip() if current else block
+        if len(proposed) <= TELEGRAM_SAFE_LIMIT:
+            current = proposed
+            current_ids.update(ids)
+            continue
+        if current:
+            chunks.append((current, sorted(current_ids)))
+        while len(block) > TELEGRAM_SAFE_LIMIT:
+            point = block.rfind("\n", 0, TELEGRAM_SAFE_LIMIT)
+            point = TELEGRAM_SAFE_LIMIT if point <= 0 else point
+            chunks.append((block[:point], sorted(ids)))
+            block = block[point:].lstrip("\n")
+        current, current_ids = block, set(ids)
+    if current:
+        chunks.append((current, sorted(current_ids)))
     return chunks
 
 
@@ -173,6 +220,22 @@ class DigestService:
         return sorted(by_event.values(), key=_event_order)[:limit]
 
     @staticmethod
+    def _suppress_equivalent_registration_urls(
+        session: Session, pairs: list[tuple[EventChange, Event]]
+    ) -> list[tuple[EventChange, Event]]:
+        """Clear old pending URL changes caused solely by known tracking keys."""
+
+        suppressed = [
+            change for change, _ in pairs
+            if change.change_type == "registration_url"
+            and same_event_destination(change.old_value, change.new_value)
+        ]
+        if suppressed:
+            mark_changes_digested(session, suppressed)
+        suppressed_ids = {change.id for change in suppressed}
+        return [(change, event) for change, event in pairs if change.id not in suppressed_ids]
+
+    @staticmethod
     def _suppress_reverted_formats(
         session: Session, pairs: list[tuple[EventChange, Event]]
     ) -> list[tuple[EventChange, Event]]:
@@ -199,27 +262,169 @@ class DigestService:
             mark_changes_digested(session, suppressed)
         return [(change, event) for change, event in pairs if change.id not in suppressed_ids]
 
+    @staticmethod
+    def _suppress_reverted_schedules(
+        session: Session, pairs: list[tuple[EventChange, Event]]
+    ) -> list[tuple[EventChange, Event]]:
+        """Drop closed date-change cycles only when one current field confirms them.
+
+        Both starts_at and ends_at are recorded as ``schedule``. Keep a
+        connected group when both current fields occur in it, since that can
+        represent two real changes with crossing values.
+        """
+
+        by_event: dict[int, list[EventChange]] = {}
+        events: dict[int, Event] = {}
+        for change, event in pairs:
+            if change.change_type == "schedule":
+                by_event.setdefault(event.id, []).append(change)
+                events[event.id] = event
+        suppressed: list[EventChange] = []
+        for event_id, changes in by_event.items():
+            event = events[event_id]
+            current = [
+                _as_utc(value).isoformat()
+                for value in (event.starts_at, event.ends_at)
+                if value is not None
+            ]
+            remaining = changes.copy()
+            while remaining:
+                values = {remaining[0].old_value, remaining[0].new_value}
+                component: list[EventChange] = []
+                while connected := [
+                    change for change in remaining
+                    if change.old_value in values or change.new_value in values
+                ]:
+                    for change in connected:
+                        remaining.remove(change)
+                        component.append(change)
+                        values.update((change.old_value, change.new_value))
+                if None in values:
+                    continue
+                balance: dict[str, int] = {}
+                for change in component:
+                    assert change.old_value is not None and change.new_value is not None
+                    balance[change.old_value] = balance.get(change.old_value, 0) - 1
+                    balance[change.new_value] = balance.get(change.new_value, 0) + 1
+                oldest = min(
+                    component,
+                    key=lambda change: (_as_utc(change.observed_at), change.id or 0),
+                )
+                if (
+                    all(delta == 0 for delta in balance.values())
+                    and current.count(oldest.old_value) == 1
+                    and not any(value in values for value in current if value != oldest.old_value)
+                ):
+                    suppressed.extend(component)
+        if suppressed:
+            mark_changes_digested(session, suppressed)
+        suppressed_ids = {change.id for change in suppressed}
+        return [(change, event) for change, event in pairs if change.id not in suppressed_ids]
+
     def _create_run(self, session: Session, now: datetime, changes: list[EventChange]) -> DigestRun:
         run = DigestRun(digest_date=_digest_date(now), event_change_ids=[c.id for c in changes if c.id])
         session.add(run)
-        session.commit()
-        session.refresh(run)
+        # The run and its frozen delivery bodies must be committed together.
+        session.flush()
         return run
 
-    def _deliveries(self, session: Session, run: DigestRun, grouped: list[tuple[Event, list[EventChange]]]) -> list[DigestDelivery]:
+    @staticmethod
+    def _failed_carry(
+        session: Session, digest_date: str
+    ) -> tuple[list[DigestDelivery], list[EventChange], set[int]]:
+        """Recover unsent frozen chunks from the newest unresolved failed day.
+
+        All failed-run IDs are excluded from fresh rendering until their saved
+        chunks have been recovered. A legacy chunk has no attribution, so its
+        unsent copies conservatively depend on every unresolved ID in that run.
+        """
+
+        excluded: set[int] = set()
+        selected: tuple[list[DigestDelivery], list[EventChange]] | None = None
+        for prior in session.exec(
+            select(DigestRun)
+            .where(DigestRun.status == "failed", DigestRun.digest_date < digest_date)
+            .order_by(DigestRun.digest_date.desc())
+        ):
+            pending = [
+                change for change_id in prior.event_change_ids
+                if (change := session.get(EventChange, change_id)) and change.digested_at is None
+            ]
+            if not pending:
+                continue
+            deliveries = list(session.exec(
+                select(DigestDelivery)
+                .where(DigestDelivery.digest_run_id == prior.id)
+                .order_by(DigestDelivery.chunk_index)
+            ))
+            if not deliveries:
+                # Nothing was frozen or sent; the pending changes can be rendered.
+                continue
+            unsent = [delivery for delivery in deliveries if not delivery.sent_at]
+            if not unsent:
+                mark_changes_digested(session, pending)
+                continue
+            excluded.update(change.id for change in pending if change.id is not None)
+            if unsent and selected is None:
+                selected = (unsent, pending)
+        if selected:
+            return selected[0], selected[1], excluded
+        return [], [], excluded
+
+    @staticmethod
+    def _mark_completed_changes(
+        session: Session, run: DigestRun, deliveries: list[DigestDelivery]
+    ) -> None:
+        if not deliveries or any(delivery.event_change_ids is None for delivery in deliveries):
+            # Legacy attribution is unknowable unless every saved chunk succeeds.
+            if deliveries and all(delivery.sent_at for delivery in deliveries):
+                mark_changes_digested(session, [change for change, _ in DigestService._run_pairs(session, run)])
+            return
+        required: dict[int, list[DigestDelivery]] = {}
+        for delivery in deliveries:
+            for change_id in delivery.event_change_ids or []:
+                required.setdefault(change_id, []).append(delivery)
+        completed = [
+            change for change_id, chunks in required.items()
+            if all(chunk.sent_at for chunk in chunks)
+            and (change := session.get(EventChange, change_id))
+            and change.digested_at is None
+        ]
+        if completed:
+            mark_changes_digested(session, completed)
+
+    def _deliveries(
+        self, session: Session, run: DigestRun,
+        grouped: list[tuple[Event, list[EventChange]]],
+        carry: list[DigestDelivery] | None = None,
+        carry_ids: list[int] | None = None,
+    ) -> list[DigestDelivery]:
         deliveries = list(session.exec(select(DigestDelivery).where(DigestDelivery.digest_run_id == run.id).order_by(DigestDelivery.chunk_index)).all())
         if deliveries:
             return deliveries
-        text = "EventFinder: new or changed technical events\n\n" + "\n\n".join(_format_event(event, changes) for event, changes in grouped)
-        deliveries = [DigestDelivery(digest_run_id=run.id, chunk_index=index, body=body) for index, body in enumerate(split_message(text))]
+        frozen = [
+            (delivery.body, delivery.event_change_ids if delivery.event_change_ids is not None else carry_ids or [])
+            for delivery in (carry or [])
+        ]
+        chunks = frozen + (_digest_chunks(grouped) if grouped else [])
+        deliveries = [
+            DigestDelivery(digest_run_id=run.id, chunk_index=index, body=body, event_change_ids=ids)
+            for index, (body, ids) in enumerate(chunks)
+        ]
         session.add_all(deliveries)
         session.commit()
         return deliveries
 
-    async def _resume(self, session: Session, run: DigestRun, grouped: list[tuple[Event, list[EventChange]]], now: datetime) -> dict[str, object]:
+    async def _resume(
+        self, session: Session, run: DigestRun, grouped: list[tuple[Event, list[EventChange]]],
+        now: datetime, carry: list[DigestDelivery] | None = None,
+        carry_ids: list[int] | None = None,
+    ) -> dict[str, object]:
+        event_count = len({event.id for _, event in self._run_pairs(session, run)})
         if run.status == "sent":
-            return {"status": "already_sent", "events": len(grouped), "chunks": 0}
-        deliveries = self._deliveries(session, run, grouped)
+            return {"status": "already_sent", "events": event_count, "chunks": 0}
+        deliveries = self._deliveries(session, run, grouped, carry, carry_ids)
+        self._mark_completed_changes(session, run, deliveries)
         sent = failures = 0
         for delivery in deliveries:
             if delivery.sent_at or delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS or (
@@ -237,6 +442,7 @@ class DigestService:
                 failures += 1
             session.add(delivery)
             session.commit()
+            self._mark_completed_changes(session, run, deliveries)
         pending = [d for d in deliveries if not d.sent_at]
         if pending:
             if all(delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS for delivery in pending):
@@ -247,7 +453,7 @@ class DigestService:
                 session.commit()
                 return {
                     "status": "failed",
-                    "events": len(grouped),
+                    "events": event_count,
                     "chunks": len(deliveries),
                     "sent": sent,
                     "failures": failures,
@@ -255,11 +461,12 @@ class DigestService:
             run.status = "partial"
             session.add(run)
             session.commit()
-            return {"status": "partial", "events": len(grouped), "chunks": len(deliveries), "sent": sent, "failures": failures}
+            return {"status": "partial", "events": event_count, "chunks": len(deliveries), "sent": sent, "failures": failures}
         run.status, run.completed_at = "sent", utcnow()
         session.add(run)
-        mark_changes_digested(session, [change for change, _ in self._run_pairs(session, run)])
-        return {"status": "sent", "events": len(grouped), "chunks": len(deliveries), "sent": sent}
+        self._mark_completed_changes(session, run, deliveries)
+        session.commit()
+        return {"status": "sent", "events": event_count, "chunks": len(deliveries), "sent": sent}
 
     async def _send_daily_digest_locked(self, now: datetime) -> dict[str, object]:
         with self.session_factory() as session:
@@ -280,13 +487,21 @@ class DigestService:
                 return {"status": "already_sent", "events": 0, "chunks": 0}
             if current_run and current_run.status == "failed":
                 return {"status": "failed", "events": 0, "chunks": 0}
-            pairs = self._suppress_reverted_formats(session, pending_changes(session))
-            grouped = self._group(pairs, self.limit)
+            carry, carried_changes, excluded = self._failed_carry(session, digest_date)
+            pairs = [(change, event) for change, event in pending_changes(session) if change.id not in excluded]
+            pairs = self._suppress_equivalent_registration_urls(session, pairs)
+            pairs = self._suppress_reverted_formats(session, pairs)
+            pairs = self._suppress_reverted_schedules(session, pairs)
+            carried_events = len({change.event_id for change in carried_changes})
+            grouped = self._group(pairs, max(0, self.limit - carried_events))
             selected = [change for _, changes in grouped for change in changes]
-            if not selected:
+            if not selected and not carry:
                 return {"status": "silent", "events": 0, "chunks": 0}
-            run = current_run or self._create_run(session, now, selected)
-            return await self._resume(session, run, grouped, now)
+            run = current_run or self._create_run(session, now, carried_changes + selected)
+            return await self._resume(
+                session, run, grouped, now, carry,
+                [change.id for change in carried_changes if change.id is not None],
+            )
 
     async def send_daily_digest(self, now: datetime | None = None) -> dict[str, object]:
         now = _as_utc(now or utcnow())

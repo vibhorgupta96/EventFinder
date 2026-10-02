@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 from sqlalchemy import or_
 from sqlmodel import Session, select
@@ -12,6 +13,11 @@ from sqlmodel import Session, select
 from eventfinder.domain import EventCandidate, RegistrationState, has_explicit_paid_price
 from eventfinder.models import Event, EventChange, EventSource, SourceRun, utcnow
 from eventfinder.policy import Assessment
+from eventfinder.urls import (
+    meetup_event_identity_url,
+    nvidia_webinar_identity_url,
+    same_event_destination,
+)
 
 # Mirrors the alias set in policy.BENGALURU_PATTERN (kept independent so this
 # module can build a SQL-level, case-insensitive LIKE predicate over the
@@ -82,9 +88,48 @@ def _candidate_trust_wins(event: Event, assessment: Assessment) -> bool:
     return TRUST_RANK.get(assessment.organizer_trust, 0) >= TRUST_RANK.get(event.organizer_trust, 0)
 
 
+def _meetup_survivor_rank(event: Event) -> tuple[bool, int, int, int]:
+    """Keep one eligible row, then prefer more observed facts with stable ties."""
+
+    facts = sum((
+        event.starts_at is not None,
+        event.ends_at is not None,
+        bool(event.venue),
+        bool(event.city),
+        event.format != "unknown",
+        bool(event.organizer),
+        bool(event.description),
+        event.registration_state != "unknown",
+        event.registration_deadline is not None,
+    ))
+    return (event.status == "eligible", facts, event.score, -(event.id or 0))
+
+
 def find_existing(session: Session, candidate: EventCandidate) -> Event | None:
+    meetup_identity = meetup_event_identity_url(candidate.canonical_url)
+    if meetup_identity:
+        parsed = urlsplit(meetup_identity)
+        path_prefix = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        matches = [
+            match
+            for match in session.exec(select(Event).where(Event.canonical_url.startswith(path_prefix)))
+            if meetup_event_identity_url(match.canonical_url) == meetup_identity
+        ]
+        if matches:
+            return max(matches, key=_meetup_survivor_rank)
     event = session.exec(select(Event).where(Event.canonical_url == candidate.canonical_url)).first()
-    return event or session.exec(select(Event).where(Event.normalized_key == normalized_key(candidate))).first()
+    if event:
+        return event
+    event = session.exec(select(Event).where(Event.normalized_key == normalized_key(candidate))).first()
+    if event and meetup_identity:
+        existing_meetup_identity = meetup_event_identity_url(event.canonical_url)
+        if existing_meetup_identity and existing_meetup_identity != meetup_identity:
+            return None
+    if event and (nvidia_identity := nvidia_webinar_identity_url(candidate.canonical_url)):
+        existing_nvidia_identity = nvidia_webinar_identity_url(event.canonical_url)
+        if existing_nvidia_identity and existing_nvidia_identity != nvidia_identity:
+            return None
+    return event
 
 
 def _merge_scalar(event: Event, field: str, value: object, assessment: Assessment, unknown: str | None = None) -> None:
@@ -116,18 +161,25 @@ def _merge_registration_state(event: Event, candidate: EventCandidate, assessmen
 
 def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assessment) -> None:
     previous_state = event.registration_state
+    trusted_rejection = assessment.status != "rejected" or _candidate_trust_wins(event, assessment)
     _merge_scalar(event, "title", candidate.title, assessment)
     for field, value in (
         ("organizer", candidate.organizer), ("description", candidate.description),
-        ("starts_at", candidate.starts_at), ("ends_at", candidate.ends_at), ("venue", candidate.venue),
+        ("venue", candidate.venue),
         ("city", candidate.city), ("country", candidate.country),
         ("registration_url", candidate.registration_url),
         ("registration_deadline", candidate.registration_deadline),
         ("registration_opened_at", candidate.registration_opened_at),
         ("first_observed_open_at", candidate.first_observed_open_at),
-        ("price_text", candidate.price_text), ("eligibility_text", candidate.eligibility_text),
     ):
         _merge_scalar(event, field, value, assessment)
+    # Rejected weaker evidence cannot fill policy-sensitive gaps in an
+    # accepted event while its lifecycle rejection is deliberately ignored.
+    if trusted_rejection:
+        _merge_scalar(event, "starts_at", candidate.starts_at, assessment)
+        _merge_scalar(event, "ends_at", candidate.ends_at, assessment)
+        _merge_scalar(event, "price_text", candidate.price_text, assessment)
+        _merge_scalar(event, "eligibility_text", candidate.eligibility_text, assessment)
     _merge_scalar(event, "format", candidate.format.value, assessment, RegistrationState.UNKNOWN.value)
     _merge_scalar(event, "event_type", candidate.event_type.value, assessment, "unknown")
     registration_state_accepted = _merge_registration_state(event, candidate, assessment)
@@ -139,7 +191,7 @@ def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assess
     ):
         event.first_observed_open_at = candidate.first_observed_open_at or candidate.evidence.observed_at
     candidate_price = _price_status(candidate)
-    if candidate_price != "not_stated" and (event.price_status == "not_stated" or _candidate_trust_wins(event, assessment)):
+    if trusted_rejection and candidate_price != "not_stated" and (event.price_status == "not_stated" or _candidate_trust_wins(event, assessment)):
         event.price_status = candidate_price
     event.speakers = sorted(set(event.speakers) | set(candidate.speakers))
     event.topics = sorted(set(event.topics) | set(candidate.topics))
@@ -149,7 +201,8 @@ def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assess
         event.ai_provenance = assessment.ai_provenance
     event.organizer_trust = max((event.organizer_trust, assessment.organizer_trust), key=lambda x: TRUST_RANK.get(x, 0))
     event.approval_required = event.approval_required or assessment.approval_required
-    event.relevance_reason = assessment.reason
+    if trusted_rejection:
+        event.relevance_reason = assessment.reason
     event.score = max(event.score, assessment.score)
     state_conflict = (
         candidate.registration_state.value in TERMINAL_STATES
@@ -158,7 +211,7 @@ def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assess
     visibility_end = event.ends_at or event.starts_at
     if visibility_end and _as_utc(visibility_end) < utcnow():
         event.status = "expired"
-    elif not state_conflict:
+    elif not state_conflict and trusted_rejection:
         # A sparse re-observation should not demote an already-qualified event
         # merely because that cross-posting omitted facts we still retain.
         if event.id is None or not (
@@ -184,6 +237,20 @@ def _refresh_provenance(session: Session, event: Event, candidate: EventCandidat
     assert event.id is not None
     source = session.exec(select(EventSource).where(EventSource.event_id == event.id, EventSource.source_url == candidate.source_url)).first()
     evidence = {**candidate.evidence.facts, "organizer_trust": assessment.organizer_trust}
+    if assessment.status == "rejected" and not _candidate_trust_wins(event, assessment):
+        unmerged = {
+            field: value
+            for field, value in (
+                ("starts_at", _text_value(candidate.starts_at)),
+                ("ends_at", _text_value(candidate.ends_at)),
+                ("price_text", candidate.price_text),
+                ("is_explicitly_paid", True if candidate.is_explicitly_paid else None),
+                ("eligibility_text", candidate.eligibility_text),
+            )
+            if _present(value)
+        }
+        if unmerged:
+            evidence["unmerged_facts"] = unmerged
     if source is None:
         session.add(EventSource(event_id=event.id, source_name=candidate.source_name, source_url=candidate.source_url, raw_id=candidate.evidence.raw_id, evidence=evidence, observed_at=candidate.evidence.observed_at))
     else:
@@ -210,7 +277,17 @@ def upsert_candidate(session: Session, candidate: EventCandidate, assessment: As
         session.add(event)
         session.flush()
         assert event.id is not None
-        changes = [EventChange(event_id=event.id, change_type=kind, old_value=_text_value(old_values[field]), new_value=_text_value(getattr(event, field))) for field, kind in MATERIAL_FIELDS.items() if _text_value(old_values[field]) != _text_value(getattr(event, field))]
+        changes = []
+        for field, kind in MATERIAL_FIELDS.items():
+            old_value = _text_value(old_values[field])
+            new_value = _text_value(getattr(event, field))
+            if old_value == new_value or (
+                field == "registration_url" and same_event_destination(old_value, new_value)
+            ):
+                continue
+            changes.append(EventChange(
+                event_id=event.id, change_type=kind, old_value=old_value, new_value=new_value
+            ))
     _refresh_provenance(session, event, candidate, assessment)
     session.add_all(changes)
     session.commit()
@@ -253,7 +330,7 @@ def _phrase_match(needle: str, haystack: str) -> bool:
     return bool(re.search(rf"(?<!\w){re.escape(needle.casefold())}(?!\w)", haystack.casefold()))
 
 
-def list_events(session: Session, *, text: str | None = None, topic: str | None = None, event_type: str | None = None, event_types: list[str] | None = None, organizer: str | None = None, event_format: str | None = None, registration_state: str | None = None, source: str | None = None, start_after: datetime | None = None, start_before: datetime | None = None, opened_after: datetime | None = None, bengaluru_only: bool = False, status: str | None = None, limit: int = 100) -> list[Event]:
+def list_events(session: Session, *, text: str | None = None, topic: str | None = None, event_type: str | None = None, event_types: list[str] | None = None, organizer: str | None = None, event_format: str | None = None, registration_state: str | None = None, source: str | None = None, start_after: datetime | None = None, start_before: datetime | None = None, start_before_exclusive: bool = False, opened_after: datetime | None = None, bengaluru_only: bool = False, status: str | None = None, limit: int = 100) -> list[Event]:
     statement = select(Event).where(Event.status == (status or "eligible"))
     if text:
         statement = statement.where((Event.title.ilike(f"%{text}%")) | (Event.description.ilike(f"%{text}%")))
@@ -268,9 +345,10 @@ def list_events(session: Session, *, text: str | None = None, topic: str | None 
     if registration_state:
         statement = statement.where(Event.registration_state == registration_state)
     if start_after:
-        statement = statement.where(Event.starts_at >= start_after)
+        statement = statement.where(Event.starts_at >= _as_utc(start_after))
     if start_before:
-        statement = statement.where(Event.starts_at <= start_before)
+        bound = _as_utc(start_before)
+        statement = statement.where(Event.starts_at < bound if start_before_exclusive else Event.starts_at <= bound)
     if opened_after:
         # Either column can carry the "registration opened" fact depending on
         # whether the open transition was explicitly dated or only observed.

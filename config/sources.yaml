@@ -25,14 +25,14 @@ sources:
   - name: hasgeek
     adapter: public_page
     platform: hasgeek
-    url: https://hasgeek.com/events
+    url: https://hasgeek.com/
     allowed_domains: [hasgeek.com]
+    detail_link_selectors: ["ul.upcoming a.card--upcoming[href]"]
+    max_detail_pages: 4
     enabled: true
     priority: true
     cadence_hours: 3
     rate_limit_seconds: 3
-    max_pages: 2
-    pagination_param: page
   - name: devfolio
     adapter: public_page
     platform: devfolio
@@ -63,8 +63,11 @@ sources:
   - name: gdg_bengaluru
     adapter: public_page
     platform: official
-    url: https://gdg.community.dev/gdg-bengaluru/
+    url: https://gdg.community.dev/gdg-bangalore/
     allowed_domains: [gdg.community.dev]
+    detail_link_selectors: ["a[href*='/events/details/google-gdg-bangalore-presents-']"]
+    detail_link_prefixes: [/events/details/google-gdg-bangalore-presents-]
+    max_detail_pages: 4
     enabled: true
     priority: true
     cadence_hours: 3
@@ -94,8 +97,10 @@ sources:
     date_dayfirst: false
   - name: nvidia_developer
     adapter: public_page
-    platform: official
-    url: https://developer.nvidia.com/events
+    # The NVIDIA webinar portal's public bundle fetches this published feed
+    # and links each event through its numeric #/webinar/{eventId} route.
+    platform: nvidia_webinar
+    url: https://www.nvidia.com/content/dam/en-zz/Solutions/about-nvidia/webinar/webinarJSONData.json
     allowed_domains: [nvidia.com]
     enabled: true
     priority: false

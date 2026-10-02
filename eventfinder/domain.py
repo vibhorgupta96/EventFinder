@@ -64,7 +64,7 @@ def has_explicit_paid_price(value: Any) -> bool:
     price = normalized.casefold() if normalized else ""
     if not price:
         return False
-    currency = r"(?:₹|\$|€|£|inr|usd|rs\.?)"
+    currency = r"(?:₹|\$|€|£|(?<![a-z])(?:inr|usd|eur|cad|aud|gbp|sgd|jpy|cny)(?![a-z])|\brs\.?)"
     number = r"(\d+(?:\.\d+)?)"
     amounts = re.findall(rf"(?:{currency}\s*{number}|{number}\s*{currency})", price)
     numeric_amounts = [next(amount for amount in match if amount) for match in amounts]

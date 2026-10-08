@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 import httpx
@@ -20,6 +20,7 @@ from eventfinder.repository import (
     expire_past_events,
     find_existing,
     finish_source_run,
+    revalidate_notification_policy,
     start_source_run,
     upsert_candidate,
 )
@@ -88,9 +89,40 @@ def _observed_event_provenance(source: EventSource, definition: SourceDefinition
             and str(observed_event.get("eventId")) == webinar_id
         )
     return isinstance(parser, str) and (
-        parser in {"json_ld", "embedded_json", "opengraph"}
+        parser in {"json_ld", "embedded_json", "opengraph", "meetup:apollo", "ocg:attendance"}
         or parser.endswith((":semantic_labels", ":html"))
     )
+
+
+def _refresh_origin(event: Event, sources: list[EventSource],
+                    definitions: dict[str, SourceDefinition]) -> tuple[EventSource, SourceDefinition] | None:
+    attributed = sorted(
+        sources,
+        key=lambda source: ({"low": 0, "medium": 1, "high": 2}.get(source.evidence.get("organizer_trust"), 0), source.observed_at),
+        reverse=True,
+    )
+    return next((
+        (source, definitions[source.source_name])
+        for source in attributed
+        if source.source_name in definitions
+        and _observed_event_provenance(source, definitions[source.source_name], event.canonical_url)
+        and _within_source(source.source_url, _source_domains(definitions[source.source_name]))
+        and _within_source(event.canonical_url, _source_domains(definitions[source.source_name]))
+    ), None)
+
+
+def _review_refresh_at(sources: list[EventSource]) -> datetime | None:
+    attempts = []
+    for source in sources:
+        value = source.evidence.get("admission_review_refresh_at")
+        if not isinstance(value, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        attempts.append(parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC))
+    return max(attempts) if attempts else None
 
 
 class DiscoveryService:
@@ -136,6 +168,7 @@ class DiscoveryService:
 
         totals = {"sources": 0, "fetched": 0, "accepted": 0, "review": 0, "rejected": 0, "errors": 0}
         with self.session_factory() as session:
+            revalidate_notification_policy(session, self.config)
             totals["expired"] = expire_past_events(session)
         for definition in self.sources.sources:
             if not definition.enabled or not self._should_run(definition, force):
@@ -235,15 +268,19 @@ class DiscoveryService:
             self.organizers,
             classifier=self.classifier,
         )
-        upsert_candidate(session, candidate, assessment)
+        upsert_candidate(session, candidate, assessment, self.config)
         return assessment.status
 
     async def refresh_known_events(self, limit: int = 50) -> dict[str, int]:
         """Refresh factual registration/status fields from known public event pages."""
 
         now = datetime.now(UTC)
+        limit = max(0, min(limit, 50))
+        if not limit:
+            return {"refreshed": 0, "errors": 0, "skipped": 0}
+        definitions = {source.name: source for source in self.sources.sources if source.enabled}
         with self.session_factory() as session:
-            events = list(
+            eligible = list(
                 session.exec(
                     select(Event)
                     .where(Event.status == "eligible")
@@ -251,11 +288,38 @@ class DiscoveryService:
                     .limit(limit)
                 ).all()
             )
+            review = list(session.exec(select(Event).where(
+                Event.status == "needs_review",
+                Event.relevance_reason.in_([
+                    "Free admission is not verified",
+                    "Legacy free admission lacks event-specific evidence",
+                ]),
+                Event.starts_at >= now,
+                Event.starts_at <= now + timedelta(days=self.config.policy.newly_opened_extended_days),
+            )).all())
             provenance = {
                 event.id: list(session.exec(select(EventSource).where(EventSource.event_id == event.id)).all())
-                for event in events
+                for event in [*eligible, *review]
             }
-        definitions = {source.name: source for source in self.sources.sources if source.enabled}
+        origins = {event.id: _refresh_origin(event, provenance[event.id], definitions)
+                   for event in [*eligible, *review]}
+        # Filter cooling rows before applying the cap. Oldest attempts go
+        # first so a repeatedly unavailable source cannot starve other rows.
+        due = []
+        for event in review:
+            origin = origins[event.id]
+            if origin is None:
+                continue
+            attempted_at = _review_refresh_at(provenance[event.id])
+            if attempted_at and now - attempted_at < timedelta(hours=origin[1].cadence_hours):
+                continue
+            due.append((attempted_at or datetime.min.replace(tzinfo=UTC), event.id, event))
+        review_budget = min(10, max(1, limit // 5))
+        if eligible:
+            review_budget = min(review_budget, limit - 1)
+        recovering = [item[2] for item in sorted(due, key=lambda item: item[:2])[:review_budget]]
+        recovery_ids = {event.id for event in recovering}
+        events = [*eligible[:limit - len(recovering)], *recovering]
         refreshed = errors = skipped = 0
         for event in events:
             visibility_end = event.ends_at or event.starts_at
@@ -263,23 +327,23 @@ class DiscoveryService:
                 visibility_end.replace(tzinfo=UTC) if visibility_end.tzinfo is None else visibility_end.astimezone(UTC)
             ) < now:
                 continue
-            attributed_sources = sorted(
-                provenance[event.id],
-                key=lambda source: ({"low": 0, "medium": 1, "high": 2}.get(source.evidence.get("organizer_trust"), 0), source.observed_at),
-                reverse=True,
-            )
-            original = next((
-                definitions[source.source_name]
-                for source in attributed_sources
-                if source.source_name in definitions
-                and _observed_event_provenance(source, definitions[source.source_name], event.canonical_url)
-                and _within_source(source.source_url, _source_domains(definitions[source.source_name]))
-                and _within_source(event.canonical_url, _source_domains(definitions[source.source_name]))
-            ), None)
-            if original is None:
+            origin = origins[event.id]
+            if origin is None:
                 logger.info("Skipping refresh without verified source provenance: {}", event.canonical_url)
                 skipped += 1
                 continue
+            attributed_source, original = origin
+            if event.id in recovery_ids:
+                # This is an operational cooldown, never an admission fact.
+                # Save attempts before fetching so denial/error paths respect
+                # the same source cadence as successful refreshes.
+                with self.session_factory() as session:
+                    source_row = session.get(EventSource, attributed_source.id)
+                    if source_row is not None:
+                        source_row.evidence = {**source_row.evidence,
+                                               "admission_review_refresh_at": now.isoformat()}
+                        session.add(source_row)
+                        session.commit()
             # Preserve source identity, parsing conventions and boundaries;
             # refreshing one event must not crawl its related-event links.
             # NVIDIA's verified HashRouter identities exist only in its feed;

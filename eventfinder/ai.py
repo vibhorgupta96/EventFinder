@@ -34,6 +34,9 @@ def _prompt(candidate: EventCandidate) -> str:
     return (
         "Classify this public event candidate. Do not invent or infer dates, prices, speakers, venues, "
         "registration state, organizer facts, or eligibility facts. Return exactly JSON with keys "
+        "Social-only mixers/networking gatherings and certification, credential or exam-preparation "
+        "promotions are not technical events. Require substantive engineering content; incidental "
+        "speaker credentials do not exclude a technical talk. Never infer free admission. "
         "is_technical (boolean), compatible_eligibility (boolean), event_type (talk|meetup|workshop|"
         "conference|hackathon|buildathon|competition|unknown), topics (array of short strings), "
         "concise_summary (max 400 chars), rationale (max 400 chars).\nSource record:\n"

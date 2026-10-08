@@ -1,0 +1,523 @@
+<!doctype html>
+<html><head><meta property="og:title" content="BangPypers Sample Group">
+<script id="__NEXT_DATA__" type="application/json">{
+ "props": {
+  "pageProps": {
+   "__APOLLO_STATE__": {
+    "ROOT_QUERY": {
+     "__typename": "Query",
+     "groupByUrlname:{\"urlname\":\"bangpypers\"}": {
+      "__ref": "Group:1"
+     }
+    },
+    "Venue:1": {
+     "__typename": "Venue",
+     "id": "1",
+     "name": "Example Hall",
+     "address": "1 Sample Road",
+     "city": "Bengaluru",
+     "state": "KA",
+     "country": "in"
+    },
+    "Group:1": {
+     "__typename": "Group",
+     "id": "1",
+     "name": "BangPypers Sample Group",
+     "urlname": "bangpypers",
+     "isPrivate": false,
+     "events({\"filter\":{\"status\":[\"DRAFT\"]},\"first\":1})": {
+      "__typename": "GroupEventConnection",
+      "totalCount": 0
+     },
+     "events({\"filter\":{\"afterDateTime\":\"2026-10-07T19:04:43.268Z\",\"status\":[\"ACTIVE\",\"PAST\",\"CANCELLED\"]},\"first\":30,\"sort\":\"ASC\"})": {
+      "__typename": "GroupEventConnection",
+      "edges": [
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:101"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:102"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:103"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:104"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:105"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:106"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:107"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:108"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:109"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:110"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:111"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:112"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:114"
+        }
+       }
+      ]
+     },
+     "events({\"filter\":{\"beforeDateTime\":\"2026-10-07T19:04:43.268Z\",\"status\":[\"ACTIVE\",\"PAST\",\"CANCELLED\"]},\"first\":10,\"sort\":\"DESC\"})": {
+      "__typename": "GroupEventConnection",
+      "edges": [
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:120"
+        }
+       },
+       {
+        "__typename": "GroupEventEdge",
+        "node": {
+         "__ref": "Event:113"
+        }
+       }
+      ]
+     }
+    },
+    "Group:2": {
+     "__typename": "Group",
+     "id": "2",
+     "name": "Other Sample Group",
+     "urlname": "other-group",
+     "isPrivate": false
+    },
+    "Event:101": {
+     "__typename": "Event",
+     "id": "101",
+     "title": "Python Meetup Zero Setting Meetup",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/101/",
+     "description": "Python and AI engineering talks and hands-on sessions: Zero Setting Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-11T10:30:00+05:30",
+     "endTime": "2026-11-11T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:102": {
+     "__typename": "Event",
+     "id": "102",
+     "title": "Python Meetup Paid Workshop",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/102/",
+     "description": "Python and AI engineering talks and hands-on sessions: Paid Workshop.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": {
+      "__typename": "EventFeeSettings",
+      "accepts": "CASH",
+      "currency": "INR",
+      "amount": 500
+     },
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-12T10:30:00+05:30",
+     "endTime": "2026-11-12T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:103": {
+     "__typename": "Event",
+     "id": "103",
+     "title": "Python Meetup No Fee Field Meetup",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/103/",
+     "description": "Python and AI engineering talks and hands-on sessions: No Fee Field Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-13T10:30:00+05:30",
+     "endTime": "2026-11-13T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:104": {
+     "__typename": "Event",
+     "id": "104",
+     "title": "Python Meetup Network Event",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/104/",
+     "description": "Python and AI engineering talks and hands-on sessions: Network Event.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-14T10:30:00+05:30",
+     "endTime": "2026-11-14T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": true
+    },
+    "Event:105": {
+     "__typename": "Event",
+     "id": "105",
+     "title": "Python Meetup Venue Fee Meetup",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/105/",
+     "description": "Entry fee: INR 500 payable at the venue.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-15T10:30:00+05:30",
+     "endTime": "2026-11-15T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:106": {
+     "__typename": "Event",
+     "id": "106",
+     "title": "Python Meetup Cancelled Meetup",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/106/",
+     "description": "Python and AI engineering talks and hands-on sessions: Cancelled Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-16T10:30:00+05:30",
+     "endTime": "2026-11-16T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "CANCELLED",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:107": {
+     "__typename": "Event",
+     "id": "107",
+     "title": "Python Meetup Closed Meetup",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/107/",
+     "description": "Python and AI engineering talks and hands-on sessions: Closed Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-17T10:30:00+05:30",
+     "endTime": "2026-11-17T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpClosedSettings",
+      "rsvpsClosed": true
+     },
+     "isNetworkEvent": false
+    },
+    "Event:108": {
+     "__typename": "Event",
+     "id": "108",
+     "title": "Python Meetup Not Open Yet Meetup",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/108/",
+     "description": "Python and AI engineering talks and hands-on sessions: Not Open Yet Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-18T10:30:00+05:30",
+     "endTime": "2026-11-18T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "NOT_OPEN_YET",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:109": {
+     "__typename": "Event",
+     "id": "109",
+     "title": "Python Meetup Other Group Meetup",
+     "eventUrl": "https://www.meetup.com/other-group/events/109/",
+     "description": "Python and AI engineering talks and hands-on sessions: Other Group Meetup.",
+     "group": {
+      "__ref": "Group:2"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-19T10:30:00+05:30",
+     "endTime": "2026-11-19T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:110": {
+     "__typename": "Event",
+     "id": "110",
+     "title": "Python Meetup Past Status Meetup",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/110/",
+     "description": "Python and AI engineering talks and hands-on sessions: Past Status Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-11-20T10:30:00+05:30",
+     "endTime": "2026-11-20T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "PAST",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:120": {
+     "__typename": "Event",
+     "id": "120",
+     "title": "Python Meetup Older Meetup",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/120/",
+     "description": "Python and AI engineering talks and hands-on sessions: Older Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-09-01T10:30:00+05:30",
+     "endTime": "2026-09-01T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "PAST",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:111": {
+     "__typename": "Event",
+     "id": "111",
+     "title": "Python Meetup Foreign Group Node",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/111/",
+     "description": "Python and AI engineering talks and hands-on sessions: Zero Setting Meetup.",
+     "group": {
+      "__ref": "Group:2"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-12-11T10:30:00+05:30",
+     "endTime": "2026-12-11T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:112": {
+     "__typename": "Event",
+     "id": "112",
+     "title": "Python Meetup Foreign Slug Url",
+     "eventUrl": "https://www.meetup.com/other-group/events/112/",
+     "description": "Python and AI engineering talks and hands-on sessions: Zero Setting Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-12-12T10:30:00+05:30",
+     "endTime": "2026-12-12T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:113": {
+     "__typename": "Event",
+     "id": "113",
+     "title": "Python Meetup Before Only Active",
+     "eventUrl": "https://www.meetup.com/bangpypers/events/113/",
+     "description": "Python and AI engineering talks and hands-on sessions: Zero Setting Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-12-13T10:30:00+05:30",
+     "endTime": "2026-12-13T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    },
+    "Event:114": {
+     "__typename": "Event",
+     "id": "114",
+     "title": "Python Meetup Foreign Host",
+     "eventUrl": "https://evil.example/bangpypers/events/114/",
+     "description": "Python and AI engineering talks and hands-on sessions: Zero Setting Meetup.",
+     "group": {
+      "__ref": "Group:1"
+     },
+     "feeSettings": null,
+     "venue": {
+      "__ref": "Venue:1"
+     },
+     "dateTime": "2026-12-14T10:30:00+05:30",
+     "endTime": "2026-12-14T13:00:00+05:30",
+     "isOnline": false,
+     "eventType": "PHYSICAL",
+     "status": "ACTIVE",
+     "rsvpState": "JOIN_OPEN",
+     "rsvpSettings": {
+      "__typename": "RsvpOpenSettings",
+      "rsvpsClosed": false
+     },
+     "isNetworkEvent": false
+    }
+   }
+  }
+ }
+}</script>
+</head><body><h1>Sample group events</h1></body></html>

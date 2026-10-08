@@ -3,20 +3,24 @@ sources:
   - name: luma_bengaluru
     adapter: public_page
     platform: luma
-    url: https://lu.ma/bangalore
-    allowed_domains: [lu.ma]
+    # lu.ma (including robots.txt) 301-redirects to luma.com; a cross-domain
+    # robots redirect fails closed, so use the canonical public domain.
+    url: https://luma.com/bengaluru
+    allowed_domains: [luma.com]
+    detail_link_selectors: ["a.event-link[href^='/']"]
+    max_detail_pages: 4
     enabled: true
     priority: true
     cadence_hours: 3
     rate_limit_seconds: 3
-    max_pages: 2
-    pagination_param: page
+  # Meetup's robots.txt disallows this search (`Disallow: /*?location=*` in a
+  # later `User-agent: *` group); the meetup_* group sources cover Meetup.
   - name: meetup_bengaluru
     adapter: public_page
     platform: meetup
     url: https://www.meetup.com/find/?location=in--Bengaluru
     allowed_domains: [meetup.com]
-    enabled: true
+    enabled: false
     priority: true
     cadence_hours: 3
     rate_limit_seconds: 4
@@ -65,7 +69,7 @@ sources:
     platform: official
     url: https://gdg.community.dev/gdg-bangalore/
     allowed_domains: [gdg.community.dev]
-    detail_link_selectors: ["a[href*='/events/details/google-gdg-bangalore-presents-']"]
+    detail_link_selectors: ["div:has(> div > [role='heading']:-soup-contains('Upcoming events')) a[href*='/events/details/google-gdg-bangalore-presents-']"]
     detail_link_prefixes: [/events/details/google-gdg-bangalore-presents-]
     max_detail_pages: 4
     enabled: true
@@ -158,12 +162,16 @@ sources:
     rate_limit_seconds: 3
   - name: cncf_bengaluru
     adapter: public_page
-    platform: official
-    url: https://community.cncf.io/cloud-native-bangalore/
-    # community.cncf.io currently redirects to its public ocgroups.dev
-    # transport. It remains a fetch boundary, never an organizer identity.
-    allowed_domains: [community.cncf.io, ocgroups.dev]
-    detail_link_selectors: ["a[href*='/cncf/group/52r68y4/event/']"]
+    # Open Community Groups (ocgroups.dev) serves CNCF chapter pages. The
+    # community.cncf.io vanity URL's robots.txt redirects to community2.cncf.io,
+    # outside this boundary, so it fails closed; use the canonical public page.
+    # ocgroups.dev is a multi-community transport, never an organizer identity.
+    platform: ocg
+    url: https://ocgroups.dev/cncf/group/52r68y4
+    allowed_domains: [ocgroups.dev]
+    detail_link_selectors:
+      - "div:has(> div:-soup-contains-own('Next event')) > a[href*='/cncf/group/52r68y4/event/']"
+      - "div:has(> div > div:-soup-contains-own('Upcoming Events')) a[href*='/cncf/group/52r68y4/event/']"
     detail_link_prefixes: [/cncf/group/52r68y4/event/]
     max_detail_pages: 4
     enabled: true
@@ -175,13 +183,138 @@ sources:
     platform: official
     url: https://ace.atlassian.com/bangalore/
     allowed_domains: [ace.atlassian.com]
-    detail_link_selectors: ["a[href*='/events/details/']"]
-    detail_link_prefixes: [/events/details/]
+    detail_link_selectors: ["div:has(> div > [role='heading']:-soup-contains('Upcoming events')) a[href*='/events/details/atlassian-bangalore-presents-']"]
+    detail_link_prefixes: [/events/details/atlassian-bangalore-presents-]
     max_detail_pages: 4
     enabled: true
     priority: true
     cadence_hours: 6
     rate_limit_seconds: 3
+  # Community chapter pages: non-priority; hydrate only the chapter's own upcoming events.
+  - name: uipath_bengaluru
+    adapter: public_page
+    platform: official
+    url: https://community.uipath.com/bengaluru/
+    allowed_domains: [community.uipath.com]
+    detail_link_selectors: ["div:has(> div > [role='heading']:-soup-contains('Upcoming events')) a[href*='/events/details/uipath-bengaluru-presents-']"]
+    detail_link_prefixes: [/events/details/uipath-bengaluru-presents-]
+    max_detail_pages: 3
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: gdg_cloud_bengaluru
+    adapter: public_page
+    platform: official
+    url: https://gdg.community.dev/gdg-cloud-bengaluru/
+    allowed_domains: [gdg.community.dev]
+    detail_link_selectors: ["div:has(> div > [role='heading']:-soup-contains('Upcoming events')) a[href*='/events/details/google-gdg-cloud-bengaluru-presents-']"]
+    detail_link_prefixes: [/events/details/google-gdg-cloud-bengaluru-presents-]
+    max_detail_pages: 3
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: snowflake_bengaluru
+    adapter: public_page
+    platform: official
+    url: https://usergroups.snowflake.com/bengaluru/
+    allowed_domains: [usergroups.snowflake.com]
+    detail_link_selectors: ["div:has(> div > [role='heading']:-soup-contains('Upcoming events')) a[href*='/events/details/snowflake-bengaluru-presents-']"]
+    detail_link_prefixes: [/events/details/snowflake-bengaluru-presents-]
+    max_detail_pages: 3
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: mulesoft_bangalore
+    adapter: public_page
+    platform: official
+    url: https://meetups.mulesoft.com/bangalore/
+    allowed_domains: [meetups.mulesoft.com]
+    detail_link_selectors: ["div:has(> div > [role='heading']:-soup-contains('Upcoming events')) a[href*='/events/details/mulesoft-bangalore-presents-']"]
+    detail_link_prefixes: [/events/details/mulesoft-bangalore-presents-]
+    max_detail_pages: 3
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  - name: trailblazer_developers_bengaluru
+    adapter: public_page
+    platform: official
+    url: https://trailblazercommunitygroups.com/salesforce-developer-group-bengaluru-india/
+    allowed_domains: [trailblazercommunitygroups.com]
+    detail_link_selectors: ["div:has(> div > [role='heading']:-soup-contains('Upcoming events')) a[href*='/events/details/salesforce-salesforce-developer-group-bengaluru-india-presents-']"]
+    detail_link_prefixes: [/events/details/salesforce-salesforce-developer-group-bengaluru-india-presents-]
+    max_detail_pages: 3
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 3
+  # Meetup group pages: public embedded page state, scoped to the group; no API.
+  - name: meetup_bangpypers
+    adapter: public_page
+    platform: meetup
+    url: https://www.meetup.com/bangpypers/events/
+    allowed_domains: [meetup.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 4
+  - name: meetup_data_ai_forum
+    adapter: public_page
+    platform: meetup
+    url: https://www.meetup.com/data-ai-forum/events/
+    allowed_domains: [meetup.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 4
+  - name: meetup_presto_bangalore
+    adapter: public_page
+    platform: meetup
+    url: https://www.meetup.com/presto-bangalore/events/
+    allowed_domains: [meetup.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 4
+  - name: meetup_software_architects_bangalore
+    adapter: public_page
+    platform: meetup
+    url: https://www.meetup.com/softwarearchitectsbangalore/events/
+    allowed_domains: [meetup.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 4
+  - name: meetup_kafka_data_ai_bangalore
+    adapter: public_page
+    platform: meetup
+    url: https://www.meetup.com/bangalore-kafka-data-ai/events/
+    allowed_domains: [meetup.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 4
+  - name: meetup_apache_airflow_bangalore
+    adapter: public_page
+    platform: meetup
+    url: https://www.meetup.com/bangalore-apache-airflow-meetup/events/
+    allowed_domains: [meetup.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 4
+  - name: meetup_kong_bengaluru
+    adapter: public_page
+    platform: meetup
+    url: https://www.meetup.com/kong-bengaluru/events/
+    allowed_domains: [meetup.com]
+    enabled: true
+    priority: false
+    cadence_hours: 12
+    rate_limit_seconds: 4
   # Annual, vendor, and global calendars are useful breadth sources but do
   # not drive priority-source health or aggressive polling.
   - name: open_source_india

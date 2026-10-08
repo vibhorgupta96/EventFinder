@@ -1,10 +1,10 @@
 organizers:
   - name: Google Developer Groups Bengaluru
-    aliases: [GDG Bengaluru, GDG Bangalore, Google Developer Groups]
+    aliases: [GDG Bengaluru, GDG Bangalore, Google Developer Groups, GDG Cloud Bengaluru]
     domains: [gdg.community.dev]
     trust: high
     online_allowed: true
-    source_profiles: [gdg_bengaluru]
+    source_profiles: [gdg_bengaluru, gdg_cloud_bengaluru]
   - name: Microsoft Reactor
     aliases: [Microsoft Reactor, Microsoft]
     domains: [developer.microsoft.com, events.microsoft.com]
@@ -24,7 +24,7 @@ organizers:
     online_allowed: true
     source_profiles: [nvidia_developer]
   - name: Cloud Native Computing Foundation
-    aliases: [CNCF, Kubernetes]
+    aliases: [CNCF, Kubernetes, Cloud Native Bangalore]
     domains: [cncf.io, community.cncf.io]
     trust: high
     online_allowed: true
@@ -98,3 +98,27 @@ organizers:
     trust: high
     online_allowed: true
     source_profiles: [databricks_events]
+  - name: UiPath Community
+    aliases: [UiPath Community]
+    domains: [community.uipath.com]
+    trust: medium
+    online_allowed: false
+    source_profiles: [uipath_bengaluru]
+  - name: Snowflake User Groups
+    aliases: [Snowflake User Group]
+    domains: [usergroups.snowflake.com]
+    trust: medium
+    online_allowed: false
+    source_profiles: [snowflake_bengaluru]
+  - name: MuleSoft Meetups
+    aliases: [MuleSoft Meetup]
+    domains: [meetups.mulesoft.com]
+    trust: medium
+    online_allowed: false
+    source_profiles: [mulesoft_bangalore]
+  - name: Trailblazer Community Groups
+    aliases: [Trailblazer Community]
+    domains: [trailblazercommunitygroups.com]
+    trust: medium
+    online_allowed: false
+    source_profiles: [trailblazer_developers_bengaluru]

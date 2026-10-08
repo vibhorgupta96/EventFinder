@@ -169,7 +169,7 @@ async def test_semantic_price_evidence_marks_paid_events_for_policy(
     )[0]
     assert candidate.is_explicitly_paid is is_paid
     assessment = await assess_candidate(candidate, config, organizers)
-    assert assessment.status == ("rejected" if is_paid else "eligible")
+    assert assessment.status == ("rejected" if is_paid else "needs_review" if price == "Nada" else "eligible")
 
 
 @pytest.mark.asyncio
@@ -216,7 +216,7 @@ async def test_each_schema_offer_is_assessed_without_losing_price_evidence(confi
     assert candidate.price_text == price_text
     assert candidate.is_explicitly_paid is is_paid
     assert candidate.evidence.facts["event"]["offers"] == offers
-    assert (await assess_candidate(candidate, config, organizers)).status == ("rejected" if is_paid else "eligible")
+    assert (await assess_candidate(candidate, config, organizers)).status == ("rejected" if is_paid else "eligible" if price_text else "needs_review")
 
 
 @pytest.mark.parametrize(
@@ -449,7 +449,7 @@ def test_schema_numeric_and_postfix_prices_are_preserved(node, expected_price, i
     [
         ("foss_united_bengaluru", "foss_united_event.html", "https://platform.fossunited.org/c/bengaluru/april-meetup", "FOSS United"),
         ("global_ai_bengaluru", "global_ai_event.html", "https://globalai.community/e/bd1o37ln", "Global AI Bengaluru"),
-        ("cncf_bengaluru", "cncf_bengaluru_event.html", "https://ocgroups.dev/cncf/group/52r68y4/event/abcd", "CNCF"),
+        ("cncf_bengaluru", "ocg_event_past.html", "https://ocgroups.dev/cncf/group/52r68y4/event/quau4tx", "Cloud Native Bangalore"),
         ("atlassian_bangalore", "atlassian_bangalore_event.html", "https://ace.atlassian.com/events/details/atlassian-bangalore-presents-rovo/", "Atlassian Community"),
         ("google_search_central", "google_rsvp_event.html", "https://rsvp.withgoogle.com/events/search-central-live-bengaluru", "Google Search Central"),
         ("google_developers", "google_rsvp_event.html", "https://rsvp.withgoogle.com/events/google-developers", "Google Search Central"),
@@ -1169,8 +1169,10 @@ async def test_disallowed_registration_host_is_rejected_before_dns_resolution():
 
 
 def test_redirect_transport_domain_is_not_an_implicit_registration_allowlist():
-    definition = next(
-        source for source in get_sources_registry().sources if source.name == "cncf_bengaluru"
+    definition = SourceDefinition(
+        name="cncf_redirect_fixture", adapter="public_page", platform="official",
+        url="https://community.cncf.io/cloud-native-bangalore/",
+        allowed_domains=["community.cncf.io", "ocgroups.dev"],
     )
     source = PublicPageEventSource(
         definition,

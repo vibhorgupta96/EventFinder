@@ -8,31 +8,37 @@ import re
 import time
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta, timezone
+from math import isfinite
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
-from urllib.robotparser import RobotFileParser
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from dateutil import parser as date_parser
 from ddgs import DDGS
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from eventfinder.config import SourceDefinition, get_settings
 from eventfinder.domain import (
+    MEETUP_NO_FEE_TEXT,
     EventCandidate,
     EventFormat,
     EventType,
     FetchResult,
     RegistrationState,
     SourceEvidence,
+    free_admission_statement,
     has_explicit_paid_price,
+    mentions_payment_terms,
     normalize_price,
 )
+from eventfinder.robots import RobotsRules
 from eventfinder.urls import UnsafeURL, URLSafety, event_identity_url, validate_url_syntax
 
 USER_AGENT = "EventFinder/0.1 (+local read-only technical event discovery)"
+# robots.txt groups match this RFC 9309 product token, not the full user agent.
+ROBOTS_PRODUCT_TOKEN = USER_AGENT.split("/", 1)[0]
 ROBOTS_TTL = timedelta(hours=6)
 # A failed/unreachable robots.txt still fails closed (disallow), but caching
 # that failure for a shorter, distinct TTL stops every subsequent page fetch
@@ -89,6 +95,21 @@ def _allowed_destination(url: str, allowed_domains: set[str] | None) -> bool:
     return any(hostname == domain or hostname.endswith(f".{domain}") for domain in allowed_domains)
 
 
+def _closed_modal(node: Tag) -> bool:
+    classes = set(node.get("class") or [])
+    if "modal" not in classes or classes & {"show", "in"} or node.get("aria-modal") == "true":
+        return False
+    # Script may reveal a modal through its inline style.
+    display = re.search(r"display\s*:\s*([a-z-]+)", node.get("style") or "", re.I)
+    return display is None or display.group(1).casefold() == "none"
+
+
+def _dormant_form_widget(widget: Tag) -> bool:
+    """A contact-form CAPTCHA inside a closed modal is not a page challenge."""
+    form = widget.find_parent("form")
+    return form is not None and any(_closed_modal(p) for p in form.parents if getattr(p, "name", None))
+
+
 def _is_interstitial(text: str) -> bool:
     soup = BeautifulSoup(text, "html.parser")
     # Shared bundles and feature flags commonly mention CAPTCHA even on
@@ -110,7 +131,8 @@ def _is_interstitial(text: str) -> bool:
     if any(re.fullmatch(r"\s*(?:re)?captcha\s*", node.get_text(" ", strip=True), re.I) for node in soup.select("title, h1, h2")):
         return True
     # A rendered challenge widget may have no text until its iframe loads.
-    return bool(soup.select_one(".g-recaptcha, .h-captcha, iframe[src*='/recaptcha/'], iframe[src*='hcaptcha.com']"))
+    widgets = soup.select(".g-recaptcha, .h-captcha, iframe[src*='/recaptcha/'], iframe[src*='hcaptcha.com']")
+    return any(not _dormant_form_widget(widget) for widget in widgets)
 
 
 class EventSource(ABC):
@@ -185,7 +207,7 @@ class EventSource(ABC):
 
 
 class RobotsPolicy:
-    """Caches RobotFileParsers by origin and checks every requested path."""
+    """Caches RFC 9309 robots rules by origin and checks every requested path."""
 
     def __init__(
         self,
@@ -198,8 +220,8 @@ class RobotsPolicy:
         self.safety = safety or URLSafety()
         self.ttl = ttl
         self.negative_ttl = negative_ttl
-        # (parser or None on failure, cache expiry, discovered crawl-delay seconds)
-        self._cache: dict[str, tuple[RobotFileParser | None, datetime, float]] = {}
+        # (rules or None on failure, cache expiry, discovered crawl-delay seconds)
+        self._cache: dict[str, tuple[RobotsRules | None, datetime, float]] = {}
 
     async def allows(
         self,
@@ -215,15 +237,15 @@ class RobotsPolicy:
         origin = f"{parsed.scheme}://{parsed.netloc}"
         cached = self._cache.get(origin)
         if cached is None or cached[1] <= datetime.now(UTC):
-            parser, crawl_delay = await self._load(
+            rules, crawl_delay = await self._load(
                 origin, allowed_domains, limiter, rate_limit_seconds
             )
-            ttl = self.ttl if parser is not None else self.negative_ttl
-            self._cache[origin] = (parser, datetime.now(UTC) + ttl, crawl_delay)
-        parser = self._cache[origin][0]
-        if parser is None:
+            ttl = self.ttl if rules is not None else self.negative_ttl
+            self._cache[origin] = (rules, datetime.now(UTC) + ttl, crawl_delay)
+        rules = self._cache[origin][0]
+        if rules is None:
             return False
-        return parser.can_fetch(USER_AGENT, safe_url)
+        return rules.allows(safe_url)
 
     def crawl_delay(self, url: str) -> float:
         """Return the origin's declared Crawl-delay, or 0 if unknown/unset."""
@@ -238,7 +260,7 @@ class RobotsPolicy:
         allowed_domains: set[str] | None,
         limiter: RequestLimiter | None,
         rate_limit_seconds: float,
-    ) -> tuple[RobotFileParser | None, float]:
+    ) -> tuple[RobotsRules | None, float]:
         try:
             # The robots.txt fetch itself must observe the same per-origin
             # cadence as every other request; it is never a free first hit.
@@ -254,14 +276,11 @@ class RobotsPolicy:
         except httpx.HTTPStatusError as error:
             if error.response.status_code != 404:
                 return None, 0.0
-            parser = RobotFileParser()
-            parser.parse(["User-agent: *", "Allow: /"])
-            return parser, 0.0
+            return RobotsRules.allow_all(), 0.0
         except (httpx.HTTPError, SourceFetchError, UnsafeURL):
             return None, 0.0
-        parser = RobotFileParser()
-        parser.parse(response.text.splitlines())
-        return parser, float(parser.crawl_delay(USER_AGENT) or 0.0)
+        rules = RobotsRules.parse(response.text, ROBOTS_PRODUCT_TOKEN)
+        return rules, rules.crawl_delay
 
 
 class _CappedResponse:
@@ -462,6 +481,9 @@ class PublicPageEventSource(EventSource):
                 self.definition.source_timezone,
                 self.definition.date_dayfirst,
             )
+            if self.definition.max_detail_pages:
+                # Listing metadata describes the group/calendar, not an event.
+                parsed = [c for c in parsed if c.evidence.facts.get("parser") != "opengraph"]
             candidates.extend(await self.validated_candidates(parsed))
             for detail_url in _configured_detail_urls(
                 response.text, str(response.url), self.definition
@@ -551,12 +573,16 @@ class SearchEventSource(EventSource):
     async def fetch(self) -> FetchResult:
         if not self.definition.query:
             return FetchResult()
+        ddgs_error: Exception | None = None
         try:
             results = await asyncio.to_thread(
                 lambda: list(DDGS().text(self.definition.query, max_results=12))
             )
         except Exception as error:  # ddgs has no stable typed exception surface
-            results = await self._fallback_results(self.definition.query, error)
+            ddgs_error = error
+            results = []
+        if not results:
+            results = await self._fallback_results(self.definition.query, ddgs_error)
         observed_at = datetime.now(UTC)
         candidates: list[EventCandidate] = []
         evidence: list[SourceEvidence] = []
@@ -618,23 +644,32 @@ class SearchEventSource(EventSource):
             )
         return FetchResult(candidates=candidates, source_evidence=evidence)
 
-    async def _fallback_results(self, query: str, ddgs_error: Exception) -> list[dict[str, str]]:
+    async def _fallback_results(
+        self, query: str, ddgs_error: Exception | None = None
+    ) -> list[dict[str, str]]:
         settings = get_settings()
         providers = (
-            (settings.serper_api_key, self._search_serper),
-            (settings.brave_search_api_key, self._search_brave),
-            (settings.tavily_api_key, self._search_tavily),
-            (settings.exa_api_key, self._search_exa),
+            ("serper", settings.serper_api_key, self._search_serper),
+            ("brave", settings.brave_search_api_key, self._search_brave),
+            ("tavily", settings.tavily_api_key, self._search_tavily),
+            ("exa", settings.exa_api_key, self._search_exa),
         )
-        errors = [f"ddgs: {ddgs_error}"]
-        for key, search in providers:
+        errors = [f"ddgs: {ddgs_error}"] if ddgs_error is not None else []
+        search_succeeded = ddgs_error is None
+        for provider, key, search in providers:
             if not key:
                 continue
             try:
-                return await search(query, key)
+                results = await search(query, key)
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
-                errors.append(str(error))
-        raise SourceFetchError("search unavailable: " + "; ".join(errors))
+                errors.append(f"{provider}: {error}")
+                continue
+            search_succeeded = True
+            if results:
+                return results
+        if errors and not search_succeeded:
+            raise SourceFetchError("search unavailable: " + "; ".join(errors))
+        return []
 
     async def _search_serper(self, query: str, key: str) -> list[dict[str, str]]:
         response = await self.client.post("https://google.serper.dev/search", headers={"X-API-KEY": key}, json={"q": query, "num": 12})
@@ -647,7 +682,11 @@ class SearchEventSource(EventSource):
         return [{"href": x["url"]} for x in response.json().get("web", {}).get("results", []) if x.get("url")]
 
     async def _search_tavily(self, query: str, key: str) -> list[dict[str, str]]:
-        response = await self.client.post("https://api.tavily.com/search", json={"api_key": key, "query": query, "max_results": 12})
+        response = await self.client.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"query": query, "max_results": 12},
+        )
         response.raise_for_status()
         return [{"href": x["url"]} for x in response.json().get("results", []) if x.get("url")]
 
@@ -706,10 +745,12 @@ def _parse_time(value: Any, tz: str = "Asia/Kolkata") -> datetime | None:
 def _json_nodes(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         nodes = [value]
-        for key in ("@graph", "events", "data", "results", "items", "edges"):
+        for key in ("@graph", "events", "data", "results", "items", "edges", "itemListElement"):
             child = value.get(key)
             if isinstance(child, (dict, list)):
                 nodes.extend(_json_nodes(child))
+        if "ListItem" in str(value.get("@type", "")) and isinstance(value.get("item"), (dict, list)):
+            nodes.extend(_json_nodes(value["item"]))
         return nodes
     if isinstance(value, list):
         return [node for item in value for node in _json_nodes(item)]
@@ -873,6 +914,10 @@ def _candidate_from_mapping(
         node.get("offers") or node.get("ticket") or node.get("pricing") or node.get("tickets"), tz
     )
     price = price or normalize_price(_first_present(node, "price", "fee", "price_text"))
+    if not price and node.get("isAccessibleForFree") is True:
+        price = "Free admission"
+    admission_statement = free_admission_statement(description)
+    price = price or admission_statement
     registration_url = _text(node.get("registrationUrl") or node.get("registration_url") or node.get("registrationLink") or node.get("registerUrl") or node.get("applyUrl") or node.get("actionUrl")) or offer_url or event_url
     eligibility = _text(node.get("eligibility") or node.get("eligibility_text") or node.get("eligibilityText") or node.get("audience") or node.get("requirements"))
     speakers = [name for item in _as_list(node.get("performer") or node.get("speakers") or node.get("speaker") or node.get("presenters")) if (name := _text(item))]
@@ -893,6 +938,8 @@ def _candidate_from_mapping(
         )
     )
     evidence = SourceEvidence(source_name=source_name, source_url=page_url, observed_at=observed_at, raw_id=_text(node.get("@id") or node.get("id")), facts={"parser": parser_name, "event": node, "source_timezone": tz})
+    if admission_statement:
+        evidence.facts["admission_statement"] = admission_statement
     schema_state = _schema_registration_state(node.get("eventStatus"), offer_availability)
     parsed_state = _registration_state(explicit_registration_status) if explicit_registration_status else _registration_state(state_text)
     return EventCandidate(
@@ -1050,9 +1097,21 @@ def _semantic_candidate(
         dayfirst,
     )
     eligibility = _label_value(soup, ("eligibility", "who can participate", "who can apply"))
-    price = _label_value(soup, ("fee", "cost", "price", "entry fee"))
-    if not price and re.search(r"\bfree(?: of cost)?\b", page_text, re.I):
-        price = "Free"
+    event_container = title_node.find_parent(["main", "article"]) if title_node else None
+    # A sidebar can be inside <main>, and generic detail pages may have no
+    # <main> at all. Search a copy without navigation/other-event cards so their
+    # prices cannot become facts about the current heading's event.
+    price_scope = BeautifulSoup(str(event_container or soup), "html.parser")
+    for unrelated in price_scope.select(
+        "aside, nav, footer, .event-card, [data-event-id], [class*='related'], [class*='recommend']"
+    ):
+        if unrelated.name is None:
+            continue
+        heading = unrelated.select_one("h1")
+        if heading and heading.get_text(" ", strip=True) == title:
+            continue
+        unrelated.decompose()
+    price = _label_value(price_scope, ("fee", "cost", "price", "entry fee"))
     format_text = _label_value(soup, ("format", "event format", "mode", "how to attend"))
     registration_anchor = soup.find(
         "a",
@@ -1066,7 +1125,7 @@ def _semantic_candidate(
         source_name=source_name,
         source_url=page_url,
         observed_at=observed_at,
-        facts={"parser": f"{platform or 'generic'}:semantic_labels"},
+        facts={"parser": f"{platform or 'generic'}:semantic_labels", "admission_price": price},
     )
     return EventCandidate(
         title=title,
@@ -1100,6 +1159,290 @@ def _semantic_candidate(
     )
 
 
+_MEETUP_MODES = {"PHYSICAL": "offline", "ONLINE": "online", "HYBRID": "mixed"}
+_MEETUP_RSVP_STATES = {
+    "JOIN_OPEN": RegistrationState.OPEN,
+    "CLOSED": RegistrationState.CLOSED,
+    "WAITLIST": RegistrationState.WAITLIST,
+}
+
+
+def _first_path_segment(url: str) -> str:
+    return urlsplit(url).path.strip("/").split("/")[0].casefold()
+
+
+def _meetup_apollo_candidates(
+    soup: BeautifulSoup,
+    page_url: str,
+    source_name: str,
+    observed_at: datetime,
+    tz: str = "Asia/Kolkata",
+) -> list[EventCandidate] | None:
+    """Read a Meetup page's own public Apollo state, scoped to the page's group."""
+    script = soup.select_one("script#__NEXT_DATA__")
+    if script is None:
+        return None
+    try:
+        state = json.loads(script.get_text())["props"]["pageProps"]["__APOLLO_STATE__"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    root = state.get("ROOT_QUERY")
+    root = root if isinstance(root, dict) else {}
+    slug = _first_path_segment(page_url)
+
+    def in_scope_group(ref: Any) -> dict[str, Any] | None:
+        group = state.get(ref.get("__ref", "")) if isinstance(ref, dict) else None
+        if not isinstance(group, dict) or str(group.get("urlname") or "").casefold() != slug:
+            return None
+        return None if group.get("isPrivate") is True else group
+
+    refs: list[Any] = []
+    for key, value in root.items():
+        if key.startswith("groupByUrlname:"):
+            group = in_scope_group(value)
+            for group_key, connection in (group or {}).items():
+                if group_key.startswith("events(") and '"afterDateTime"' in group_key and isinstance(connection, dict):
+                    refs.extend(
+                        edge["node"].get("__ref")
+                        for edge in connection.get("edges") or []
+                        if isinstance(edge, dict) and isinstance(edge.get("node"), dict)
+                    )
+        elif key.startswith("event(") and isinstance(value, dict):
+            refs.append(value.get("__ref"))
+
+    candidates: list[EventCandidate] = []
+    for ref in dict.fromkeys(ref for ref in refs if isinstance(ref, str)):
+        node = state.get(ref)
+        if not isinstance(node, dict):
+            continue
+        event_url = node.get("eventUrl")
+        if (
+            not isinstance(event_url, str)
+            or _first_path_segment(event_url) != slug
+            or (urlsplit(event_url).hostname or "").casefold() not in {"meetup.com", "www.meetup.com"}
+        ):
+            continue
+        group = in_scope_group(node.get("group"))
+        if group is None or node.get("status") not in {"ACTIVE", "CANCELLED"}:
+            continue
+        online = node.get("eventType") == "ONLINE" or node.get("isOnline") is True
+        mapping: dict[str, Any] = {
+            "@type": "Event", "name": node.get("title"), "url": event_url,
+            "description": node.get("description"), "startDate": node.get("dateTime"),
+            "endDate": node.get("endTime"), "organizer": group.get("name"),
+            "eventAttendanceMode": _MEETUP_MODES.get(node.get("eventType")),
+            "isOnline": node.get("isOnline"),
+        }
+        venue = state.get(node["venue"].get("__ref", "")) if isinstance(node.get("venue"), dict) else None
+        if isinstance(venue, dict) and not online:
+            mapping["location"] = {
+                "name": venue.get("name"),
+                "address": {"streetAddress": venue.get("address"), "addressLocality": venue.get("city")},
+            }
+        fee_present = "feeSettings" in node
+        fee = node.get("feeSettings")
+        unresolved_ref = False
+        if isinstance(fee, dict) and isinstance(fee.get("__ref"), str):
+            fee = state.get(fee["__ref"])
+            unresolved_ref = not isinstance(fee, dict)
+        paid = False
+        sanitized_fee = None
+        suppressed = False
+        # Only a literal null fee on a confirmed non-network event is free evidence.
+        if node.get("feeSettings", False) is None and node.get("isNetworkEvent") is False:
+            if mentions_payment_terms(f"{mapping['name'] or ''} {mapping['description'] or ''}"):
+                suppressed = True
+            else:
+                mapping["price"] = MEETUP_NO_FEE_TEXT
+        elif isinstance(fee, dict):
+            amount = fee.get("amount")
+            sanitized_fee = {key: fee.get(key) for key in ("amount", "currency", "accepts")}
+            if isinstance(amount, (int, float)) and not isinstance(amount, bool) and isfinite(amount) and amount > 0:
+                mapping["price"] = f"{fee.get('currency') or ''} {normalize_price(amount)}".strip()
+                paid = True
+        candidate = _candidate_from_mapping(mapping, page_url, source_name, observed_at, "meetup:apollo", tz)
+        if candidate is None:
+            continue
+        candidate.is_explicitly_paid = candidate.is_explicitly_paid or paid
+        rsvp_state = node.get("rsvpState")
+        rsvp_settings = node.get("rsvpSettings")
+        if node.get("status") == "CANCELLED":
+            candidate.registration_state = RegistrationState.CANCELLED
+        elif isinstance(rsvp_settings, dict) and rsvp_settings.get("rsvpsClosed") is True and rsvp_state != "WAITLIST":
+            candidate.registration_state = RegistrationState.CLOSED
+        else:
+            candidate.registration_state = _MEETUP_RSVP_STATES.get(rsvp_state, RegistrationState.UNKNOWN)
+        candidate.evidence.raw_id = str(node["id"]) if node.get("id") else None
+        # Only sanitized facts are kept; the raw node carries member data.
+        if unresolved_ref:
+            candidate.evidence.facts["meetup_fee_settings"] = {"unresolved_ref": True}
+        elif fee_present:
+            candidate.evidence.facts["meetup_fee_settings"] = (
+                sanitized_fee if fee is None or isinstance(fee, dict) else {"unparsed_type": type(fee).__name__}
+            )
+        if mapping.get("price") == MEETUP_NO_FEE_TEXT:
+            candidate.evidence.facts["admission_evidence"] = "meetup_fee_settings_null"
+        elif suppressed:
+            candidate.evidence.facts["admission_evidence"] = "meetup_fee_settings_null_suppressed_by_payment_terms"
+        if isinstance(node.get("status"), str):
+            candidate.evidence.facts["meetup_status"] = node["status"]
+        if isinstance(rsvp_state, str):
+            candidate.evidence.facts["meetup_rsvp_state"] = rsvp_state
+        candidates.append(candidate)
+    return candidates
+
+
+OCG_APPROVAL_TEXT = "Attendee approval required"
+_OCG_ATTENDANCE_ATTRS = {
+    "data-canceled": "canceled",
+    "data-event-timezone": "event_timezone",
+    "data-registration-window-open": "registration_window_open",
+    "data-registration-window-message": "registration_window_message",
+    "data-is-simple-rsvp": "is_simple_rsvp",
+    "data-paid-capable": "paid_capable",
+    "data-ticket-is-free-only": "ticket_is_free_only",
+    "data-has-sold-out-ticket-types": "has_sold_out_ticket_types",
+    "data-attendee-approval-required": "attendee_approval_required",
+    "data-starts": "starts",
+    "data-waitlist-enabled": "waitlist_enabled",
+}
+_OCG_FULL_DATE = re.compile(r"[A-Z][a-z]+ \d{1,2}, 20\d{2}")
+_OCG_TIME_RANGE = re.compile(r"(\d{1,2}:\d{2} [AP]M) - (\d{1,2}:\d{2} [AP]M) [A-Z]{2,5}")
+_OCG_GROUP_PATH = re.compile(r"/[a-z0-9-]+/group/[a-z0-9]+")
+_OCG_EVENT_PATH = re.compile(r"/[a-z0-9-]+/group/[a-z0-9]+/event/[a-z0-9]+/?")
+
+
+def _ocg_text(node: Tag | None) -> str | None:
+    return (" ".join(node.get_text(" ", strip=True).split()) or None) if node is not None else None
+
+
+def _ocg_end_time(panel: Tag | None, starts_at: datetime, event_timezone: str | None) -> datetime | None:
+    """Displayed end time, used only when the same panel's start matches data-starts."""
+    if panel is None or not event_timezone:
+        return None
+    try:
+        zone = ZoneInfo(event_timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    texts = [_ocg_text(child) or "" for child in panel.find_all("div", recursive=False)]
+    day = next((text for text in texts if _OCG_FULL_DATE.fullmatch(text)), None)
+    hours = next((match for text in texts if (match := _OCG_TIME_RANGE.fullmatch(text))), None)
+    if day is None or hours is None:
+        return None
+    try:
+        start = date_parser.parse(f"{day} {hours.group(1)}").replace(tzinfo=zone)
+        end = date_parser.parse(f"{day} {hours.group(2)}").replace(tzinfo=zone)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if start.astimezone(UTC) != starts_at or end <= start:
+        return None
+    return end.astimezone(UTC)
+
+
+def _ocg_event_candidates(
+    soup: BeautifulSoup,
+    page_url: str,
+    source_name: str,
+    observed_at: datetime,
+    tz: str = "Asia/Kolkata",
+) -> list[EventCandidate] | None:
+    """Read an Open Community Groups event page's own public attendance attributes."""
+    container = soup.select_one("div#attendance-container-main[data-attendance-container]")
+    if container is None:
+        if _OCG_EVENT_PATH.fullmatch(urlsplit(page_url).path):
+            return []  # Event URL whose widget markup drifted: fail closed, no page-prose fallback.
+        return None  # Not an OCG event page (e.g. group listing): existing parsers apply.
+    attendance = {
+        key: " ".join(str(container.get(attr)).split())
+        for attr, key in _OCG_ATTENDANCE_ATTRS.items()
+        if container.get(attr) is not None
+    }
+    header = container.find_parent("div", class_="grid")
+    heading = header.select_one("h1") if header is not None else None
+    title = _ocg_text(heading)
+    starts_at = _parse_time(attendance.get("starts"), tz)
+    if heading is None or not title or starts_at is None:
+        return []  # The page owns its widget; never fall back to page-wide prose.
+    organizer = None
+    group_anchor = heading.find_previous_sibling("a", href=True)
+    if group_anchor is not None:
+        try:
+            group_path = urlsplit(urljoin(page_url, group_anchor["href"])).path.rstrip("/")
+        except ValueError:
+            group_path = ""
+        if _OCG_GROUP_PATH.fullmatch(group_path) and urlsplit(page_url).path.startswith(f"{group_path}/event/"):
+            organizer = _ocg_text(group_anchor)
+    venue = None
+    for label in soup.find_all("div", string=re.compile(r"^\s*Location\s*$")):
+        card = label.parent.parent if label.parent is not None else None
+        if card is None or label.find_parent(attrs={"role": "dialog"}) is not None:
+            continue
+        venue = next((text for pill in card.select("div.absolute.bottom-2.left-2")
+                      if pill.find_parent(attrs={"role": "dialog"}) is None and (text := _ocg_text(pill))), None)
+        break
+    city = "Bengaluru" if venue and re.search(r"\b(?:bengaluru|bangalore|blr)\b", venue, re.I) else None
+    badge = _ocg_text(header.select_one("span.custom-badge")) if header is not None else None
+    mode = badge if badge and badge.casefold() in {"in-person", "virtual", "hybrid"} else None
+    tickets = [
+        {
+            "price_minor": " ".join(str(ticket.get("data-ticket-price-minor", "")).split()),
+            "sold_out": " ".join(str(ticket.get("data-ticket-sold-out", "")).split()),
+            "purchasable": " ".join(str(ticket.get("data-ticket-purchasable", "")).split()),
+        }
+        for ticket in container.select("input[data-attendance-role='ticket-type-option']")
+    ]
+    badges = [_ocg_text(node) or "" for node in container.select("[data-attendance-role='ticket-type-price-badge']")]
+    paid = any(ticket["price_minor"].isdecimal() and int(ticket["price_minor"]) > 0 for ticket in tickets)
+    free = (
+        not paid
+        and attendance.get("ticket_is_free_only") == "true"
+        and attendance.get("paid_capable") != "true"
+        and bool(tickets)
+        and all(ticket["price_minor"] == "0" for ticket in tickets)
+        and bool(badges)
+        and all(text.casefold() == "free" for text in badges)
+    )
+    price = "Free" if free else (next((text for text in badges if text and text.casefold() != "free"), None) if paid else None)
+    if attendance.get("canceled") == "true":
+        state = RegistrationState.CANCELLED
+    elif tickets and all(ticket["sold_out"] == "true" for ticket in tickets):
+        state = RegistrationState.WAITLIST if attendance.get("waitlist_enabled") == "true" else RegistrationState.SOLD_OUT
+    elif attendance.get("registration_window_open") == "true":
+        state = RegistrationState.OPEN
+    elif attendance.get("registration_window_open") == "false" and attendance.get(
+        "registration_window_message", ""
+    ).casefold().startswith("registration closed"):
+        state = RegistrationState.CLOSED
+    else:
+        state = RegistrationState.UNKNOWN
+    about = next((node for node in soup.find_all("div", string=re.compile(r"^\s*About this event\s*$"))), None)
+    description = (_ocg_text(about.find_next_sibling("div")) if about is not None else None) or ""
+    description = description[:2000]
+    page_view = soup.select_one("[data-page-view][data-entity-type='event'][data-entity-id]")
+    facts: dict[str, Any] = {
+        "parser": "ocg:attendance",
+        "source_timezone": tz,
+        "ocg_attendance": attendance,
+        "ocg_tickets": tickets,
+        "admission_price": price,
+    }
+    return [EventCandidate(
+        title=title, canonical_url=page_url, source_url=page_url, source_name=source_name,
+        organizer=organizer, description=description, starts_at=starts_at,
+        ends_at=_ocg_end_time(soup.select_one("[data-registration-window-date-panel]"), starts_at,
+                              attendance.get("event_timezone")),
+        venue=venue, city=city, format=_format(mode, venue), event_type=_event_type(title, description),
+        registration_state=state, registration_url=page_url, price_text=price, is_explicitly_paid=paid,
+        eligibility_text=OCG_APPROVAL_TEXT if attendance.get("attendee_approval_required") == "true" else None,
+        evidence=SourceEvidence(
+            source_name=source_name, source_url=page_url, observed_at=observed_at,
+            raw_id=page_view.get("data-entity-id") if page_view is not None else None, facts=facts,
+        ),
+    )]
+
+
 def parse_event_page(
     html: str,
     page_url: str,
@@ -1114,6 +1457,8 @@ def parse_event_page(
     if platform == "nvidia_webinar":
         return _nvidia_webinar_candidates(html, page_url, source_name, observed_at)
     soup = BeautifulSoup(html, "html.parser")
+    if platform == "ocg" and (ocg := _ocg_event_candidates(soup, page_url, source_name, observed_at, tz)) is not None:
+        return ocg
     candidates: list[EventCandidate] = []
     for script in soup.select("script[type='application/ld+json'], script[type='application/json'], script#__NEXT_DATA__"):
         try:
@@ -1128,8 +1473,12 @@ def parse_event_page(
     candidates.extend(_html_card_candidates(soup, page_url, source_name, observed_at, platform, tz))
     if semantic := _semantic_candidate(soup, page_url, source_name, observed_at, platform, tz, dayfirst):
         candidates.append(semantic)
+    apollo = _meetup_apollo_candidates(soup, page_url, source_name, observed_at, tz) if platform == "meetup" else None
+    candidates.extend(apollo or [])
     if candidates:
         return _dedupe_candidates(candidates)
+    if apollo is not None:
+        return []  # Meetup state present but no in-scope events: no OpenGraph group junk.
     title_tag = soup.find("meta", property="og:title") or soup.title
     title = title_tag.get("content", "").strip() if title_tag and title_tag.name == "meta" else (title_tag.get_text(strip=True) if title_tag else None)
     if not title:

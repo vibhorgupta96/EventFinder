@@ -8,6 +8,7 @@ import httpx
 import pytest
 from eventfinder.config import SourceDefinition, SourcesRegistry
 from eventfinder.models import Event, EventChange, EventSource
+from eventfinder.repository import pending_changes
 from eventfinder.service import DiscoveryService
 from eventfinder.sources import parse_event_page
 from eventfinder.urls import URLSafety
@@ -56,6 +57,167 @@ async def _seed(service, session, definition, node, source_url):
     )[0]
     assert await service._persist_candidate(session, candidate) == "eligible"
     return session.exec(select(Event)).one(), candidate
+
+
+async def _seed_admission_review(service, session, definition, url, name):
+    node = _node(url, "Microsoft Reactor")
+    node.pop("price")
+    node["name"] = "AI engineering workshop " + name
+    candidate = parse_event_page(_html(node), url, definition.name, platform=definition.platform)[0]
+    assert await service._persist_candidate(session, candidate) == "needs_review"
+    event = session.exec(select(Event).where(Event.canonical_url == url)).one()
+    assert event.relevance_reason == "Free admission is not verified"
+    return event, node, candidate
+
+
+@pytest.mark.asyncio
+async def test_review_refresh_promotes_only_matching_event_and_keeps_precise_provenance(
+    session, config, organizers
+):
+    definition = SourceDefinition(name="microsoft_reactor", adapter="public_page", platform="official",
+                                  url="https://events.microsoft.com/", rate_limit_seconds=0)
+    url = "https://events.microsoft.com/review"
+    service, requested = _service(session, config, organizers, definition, "")
+    event, node, _ = await _seed_admission_review(service, session, definition, url, "review")
+    node["description"] += ". The event is free of cost."
+    incidental = {**node, "url": "https://events.microsoft.com/unrelated", "name": "Other AI workshop"}
+    await service.client.aclose()
+    service.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: (
+        requested.append(str(request.url)) or httpx.Response(200, text=(
+            "User-agent: *\nAllow: /\n" if request.url.path == "/robots.txt" else _html(node, incidental)
+        ))
+    )))
+    service.robots_policy.client = service.client
+    try:
+        result = await service.refresh_known_events()
+    finally:
+        await service.client.aclose()
+    session.expire_all()
+    updated = session.get(Event, event.id)
+    assert result == {"refreshed": 1, "errors": 0, "skipped": 0}
+    assert updated.status == "eligible"
+    assert updated.price_status == "free"
+    assert updated.price_text == "The event is free of cost"
+    assert [item.id for item in session.exec(select(Event)).all()] == [event.id]
+    source = session.exec(select(EventSource)).one()
+    assert source.evidence["admission_statement"] == "The event is free of cost"
+    assert source.evidence["admission_review_refresh_at"]
+    assert pending_changes(session)
+    assert all("unrelated" not in request for request in requested)
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_eligible_priority_and_selects_due_reviews_before_cap(
+    session, config, organizers
+):
+    definition = SourceDefinition(name="microsoft_reactor", adapter="public_page", platform="official",
+                                  url="https://events.microsoft.com/", rate_limit_seconds=0, cadence_hours=24)
+    service, requested = _service(session, config, organizers, definition, "")
+    eligible_url = "https://events.microsoft.com/eligible"
+    eligible, _ = await _seed(service, session, definition, _node(eligible_url, "Microsoft Reactor"), eligible_url)
+    cooling, cooling_node, _ = await _seed_admission_review(service, session, definition,
+                                                          "https://events.microsoft.com/cooling", "cooling")
+    due, due_node, _ = await _seed_admission_review(service, session, definition,
+                                                  "https://events.microsoft.com/due", "due")
+    never, never_node, _ = await _seed_admission_review(service, session, definition,
+                                                      "https://events.microsoft.com/never", "never")
+    for event, attempted in [(cooling, datetime.now(UTC)), (due, datetime.now(UTC) - timedelta(days=2))]:
+        source = session.exec(select(EventSource).where(EventSource.event_id == event.id)).one()
+        source.evidence = {**source.evidence, "admission_review_refresh_at": attempted.isoformat()}
+        session.add(source)
+    session.commit()
+    nodes = [_node(eligible_url, "Microsoft Reactor"), cooling_node, due_node, never_node]
+    await service.client.aclose()
+    service.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: (
+        requested.append(str(request.url)) or httpx.Response(200, text=(
+            "User-agent: *\nAllow: /\n" if request.url.path == "/robots.txt" else _html(*nodes)
+        ))
+    )))
+    service.robots_policy.client = service.client
+    try:
+        first = await service.refresh_known_events(limit=5)
+        second = await service.refresh_known_events(limit=5)
+    finally:
+        await service.client.aclose()
+    assert first == second == {"refreshed": 2, "errors": 0, "skipped": 0}
+    detail_requests = [url for url in requested if not url.endswith("robots.txt")]
+    assert detail_requests == [eligible_url, never.canonical_url, eligible_url, due.canonical_url]
+    assert cooling.canonical_url not in requested
+    session.expire_all()
+    assert session.get(Event, eligible.id).status == "eligible"
+    assert all(session.get(Event, item.id).status == "needs_review" for item in [cooling, due, never])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denial", ["robots", "captcha", "http_error"])
+async def test_review_refresh_failures_cool_down_and_sparse_observations_retain_attempt(
+    session, config, organizers, denial
+):
+    definition = SourceDefinition(name="microsoft_reactor", adapter="public_page", platform="official",
+                                  url="https://events.microsoft.com/", rate_limit_seconds=0, cadence_hours=24)
+    service, requested = _service(session, config, organizers, definition, "")
+    event, _, candidate = await _seed_admission_review(service, session, definition,
+                                                      "https://events.microsoft.com/failure", "failure")
+
+    def handler(request):
+        requested.append(str(request.url))
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\n" + ("Disallow: /\n" if denial == "robots" else "Allow: /\n"))
+        if denial == "http_error":
+            return httpx.Response(403)
+        return httpx.Response(200, text="<h1>Verify you are human</h1>")
+
+    await service.client.aclose()
+    service.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    service.robots_policy.client = service.client
+    try:
+        first = await service.refresh_known_events()
+        attempts = len(requested)
+        await service._persist_candidate(session, candidate)
+        second = await service.refresh_known_events()
+    finally:
+        await service.client.aclose()
+    assert first == {"refreshed": 0, "errors": 1, "skipped": 0}
+    assert second == {"refreshed": 0, "errors": 0, "skipped": 0}
+    assert len(requested) == attempts
+    session.expire_all()
+    assert session.get(Event, event.id).status == "needs_review"
+    assert session.exec(select(EventSource)).one().evidence["admission_review_refresh_at"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["paid", "closed", "location", "topic", "window"])
+async def test_review_refresh_reassesses_all_other_eligibility_gates(session, config, organizers, invalid):
+    definition = SourceDefinition(name="microsoft_reactor", adapter="public_page", platform="official",
+                                  url="https://events.microsoft.com/", rate_limit_seconds=0)
+    service, _ = _service(session, config, organizers, definition, "")
+    event, node, _ = await _seed_admission_review(service, session, definition,
+                                                "https://events.microsoft.com/invalid", "invalid")
+    node["description"] += ". The event is free."
+    if invalid == "paid":
+        node["description"] += " Registration fee applies."
+    elif invalid == "closed":
+        node["registrationStatus"] = "closed"
+    elif invalid == "location":
+        node["eventAttendanceMode"] = "https://schema.org/OfflineEventAttendanceMode"
+        node["location"] = {"name": "Mumbai"}
+    elif invalid == "topic":
+        node["name"], node["description"] = "Pottery meetup", "Pottery practice. The event is free."
+    else:
+        node["startDate"] = (datetime.now(UTC) + timedelta(days=240)).isoformat()
+    await service.client.aclose()
+    service.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(
+        200, text="User-agent: *\nAllow: /\n" if request.url.path == "/robots.txt" else _html(node)
+    )))
+    service.robots_policy.client = service.client
+    try:
+        result = await service.refresh_known_events()
+    finally:
+        await service.client.aclose()
+    session.expire_all()
+    assert result == {"refreshed": 1, "errors": 0, "skipped": 0}
+    assert session.get(Event, event.id).status != "eligible"
+    assert pending_changes(session) == []
 
 
 @pytest.mark.asyncio
@@ -274,6 +436,8 @@ async def test_nvidia_refresh_refetches_configured_feed_and_updates_only_known_i
     feed = json.dumps({"data": [updated_row, incidental_row]})
     service, requested = _service(session, config, organizers, definition, feed)
     initial = parse_event_page(json.dumps({"data": [row]}), feed_url, definition.name, platform=definition.platform)[0]
+    # Seed separately observed free admission; the feed supplies no price.
+    initial.price_text = "Free admission"
     assert await service._persist_candidate(session, initial) == "eligible"
     event = session.exec(select(Event)).one()
     observed = []
@@ -324,6 +488,7 @@ async def test_nvidia_refresh_requires_verified_feed_identity(
     feed = json.dumps({"data": [row]})
     service, requested = _service(session, config, organizers, definition, feed)
     candidate = parse_event_page(feed, feed_url, definition.name, platform=definition.platform)[0]
+    candidate.price_text = "Free admission"
     assert await service._persist_candidate(session, candidate) == "eligible"
     source = session.exec(select(EventSource)).one()
     if invalid == "source_url":
@@ -368,7 +533,8 @@ async def test_nvidia_distinct_ids_with_identical_metadata_survive_discovery_and
         await service.client.aclose()
     session.expire_all()
     assert discovered["fetched"] == 2
-    assert discovered["accepted"] == 2
+    assert discovered["accepted"] == 0
+    assert discovered["review"] == 2
     assert refreshed == {"refreshed": 2, "errors": 0, "skipped": 0}
     events = session.exec(select(Event)).all()
     assert len(events) == 2

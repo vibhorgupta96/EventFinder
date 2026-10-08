@@ -14,7 +14,8 @@ from eventfinder.domain import (
     EventFormat,
     EventType,
     RegistrationState,
-    has_explicit_paid_price,
+    candidate_admission_status,
+    observation_facts,
 )
 
 EXCLUDED_TERMS = (
@@ -26,14 +27,14 @@ EXCLUDED_TERMS = (
     "sales",
     "career fair",
     "job fair",
-    "networking mixer",
-    "networking event",
 )
 INELIGIBLE_TERMS = (
     "students only",
     "student-only",
     "employees only",
     "employee-only",
+    "members only",
+    "members-only",
     "invite only",
     "private event",
 )
@@ -129,7 +130,28 @@ def _topic_match(candidate: EventCandidate, config: FileConfig) -> bool:
 def _excluded(candidate: EventCandidate, config: FileConfig) -> bool:
     text = " ".join(filter(None, [candidate.title, candidate.description or ""])).lower()
     terms = set(EXCLUDED_TERMS) | {term.lower() for term in config.topics.get("exclude", [])}
-    return any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) for term in terms)
+    # Networking at a technical talk is fine; its purpose must be social-only.
+    terms -= {"networking mixer", "networking event"}
+    if any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) for term in terms):
+        return True
+    title = candidate.title.casefold()
+    # The subject of the event matters; an incidental speaker credential does
+    # not turn a substantive engineering talk into a certification promotion.
+    if re.search(r"\b(?:certifications?|certification exams?|exam prep|exam preparation|"
+                 r"credential(?:s)? (?:training|promotion))\b", title):
+        return True
+    if re.search(r"\b(?:prepare for|pass|earn|obtain) (?:an? |your |the )?"
+                 r"(?:[\w-]+\s+){0,5}(?:certification|certification exam|credential)\b", text):
+        return True
+    social = re.search(r"\b(?:mixer|social gathering|networking social|networking event|social event)\b", text)
+    facts = observation_facts(candidate.evidence.facts)
+    social_schema = any("SocialEvent" in str(fact.get("event", {}).get("@type", ""))
+                        for fact in facts if isinstance(fact.get("event"), dict))
+    substantive = re.search(
+        r"\b(?:(?:technical|engineering|developer|ai|systems|cloud) (?:talks?|workshops?|tutorials?)|"
+        r"hands-on (?:workshop|lab)|live coding|code (?:demo|walkthrough))\b", text
+    )
+    return bool((social or social_schema) and not substantive)
 
 
 def _ineligible(candidate: EventCandidate) -> bool:
@@ -147,6 +169,10 @@ def _within_window(candidate: EventCandidate, config: FileConfig, now: datetime)
         return False
     starts_at = candidate.starts_at.astimezone(UTC)
     visibility_end = (candidate.ends_at or candidate.starts_at).astimezone(UTC)
+    # A months-long series range is not evidence of a current occurrence.
+    # Short ongoing conferences/workshops still retain their real end time.
+    if starts_at < now and visibility_end - starts_at > timedelta(days=14):
+        return False
     if visibility_end < now - timedelta(days=1):
         return False
     if starts_at <= now + timedelta(days=config.policy.near_future_days):
@@ -200,12 +226,9 @@ async def assess_candidate(
 
     now = now or datetime.now(UTC)
     organizer = match_organizer(candidate, organizers)
-    if candidate.is_explicitly_paid or has_explicit_paid_price(candidate.price_text):
-        return Assessment("rejected", "Explicitly paid admission", 0, False, organizer.trust)
-    if _excluded(candidate, config):
-        return Assessment("rejected", "Excluded event category", 0, False, organizer.trust)
-    if _ineligible(candidate):
-        return Assessment("rejected", "Explicitly incompatible eligibility", 0, False, organizer.trust)
+    violation = notification_policy_violation(candidate, config, now, check_time=False)
+    if violation:
+        return Assessment(*violation, 0, _approval_required(candidate), organizer.trust)
     if candidate.registration_state in {
         RegistrationState.CANCELLED,
         RegistrationState.POSTPONED,
@@ -273,3 +296,24 @@ async def assess_candidate(
     if score < config.ranking.minimum_score:
         return Assessment("needs_review", "Below deterministic ranking threshold", score, _approval_required(candidate), organizer.trust, summary, ai_provenance)
     return Assessment("eligible", "Technical event matching location and time policy", score, _approval_required(candidate), organizer.trust, summary, ai_provenance)
+
+
+def notification_policy_violation(
+    candidate: EventCandidate, config: FileConfig, now: datetime, *, check_time: bool = True
+) -> tuple[str, str] | None:
+    """Non-AI notification gates shared with persisted-row/retry validation."""
+
+    admission = candidate_admission_status(candidate)
+    if admission == "paid":
+        return "rejected", "Explicitly paid admission"
+    if _excluded(candidate, config):
+        return "rejected", "Excluded event category"
+    if _ineligible(candidate):
+        return "rejected", "Explicitly incompatible eligibility"
+    if admission != "free":
+        return "needs_review", "Free admission is not verified"
+    if check_time and not _within_window(candidate, config, now):
+        return "needs_review", "Missing or out-of-window start time"
+    if check_time and candidate.registration_deadline and candidate.registration_deadline < now:
+        return "needs_review", "Registration deadline has passed"
+    return None

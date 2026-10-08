@@ -38,6 +38,7 @@ def candidate() -> EventCandidate:
         format=EventFormat.IN_PERSON,
         event_type=EventType.MEETUP,
         registration_state=RegistrationState.OPEN,
+        price_text="Free admission",
         speakers=["Ada Engineer"],
         topics=["AI"],
         evidence=SourceEvidence(

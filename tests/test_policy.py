@@ -31,11 +31,12 @@ async def test_explicit_policy_exclusions(candidate, config, organizers, descrip
 
 
 @pytest.mark.asyncio
-async def test_unknown_price_is_eligible_and_approval_is_badged(candidate, config, organizers):
+async def test_unknown_price_needs_review_and_approval_is_badged(candidate, config, organizers):
     candidate.price_text = None
     candidate.eligibility_text = "Application review; approval required before entry"
     assessment = await assess_candidate(candidate, config, organizers)
-    assert assessment.status == "eligible"
+    assert assessment.status == "needs_review"
+    assert assessment.reason == "Free admission is not verified"
     assert assessment.approval_required is True
 
 

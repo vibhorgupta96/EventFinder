@@ -9,7 +9,7 @@ from eventfinder.domain import (
     RegistrationState,
     SourceEvidence,
 )
-from eventfinder.models import Event, EventChange, EventSource
+from eventfinder.models import DigestDelivery, DigestRun, Event, EventChange, EventSource
 from eventfinder.policy import assess_candidate
 from eventfinder.repository import (
     expire_past_events,
@@ -141,6 +141,8 @@ async def test_meetup_exact_sparse_url_updates_richer_historical_row(
     rich = Event(
         canonical_url=rich_url,
         normalized_key="old-rich-key",
+        price_text="Free admission",
+        price_status="free",
         title=candidate.title,
         organizer=candidate.organizer,
         description=candidate.description,
@@ -184,6 +186,8 @@ async def test_meetup_eligible_row_wins_over_richer_review_row(
     eligible = Event(
         canonical_url=eligible_url,
         normalized_key="old-eligible-key",
+        price_text="Free admission",
+        price_status="free",
         title=candidate.title,
         starts_at=candidate.starts_at,
         venue=candidate.venue,
@@ -312,6 +316,17 @@ async def test_open_transition_is_observed_and_terminal_existing_event_is_persis
     assert updated.first_observed_open_at == opened.evidence.observed_at
     assert "registration_opened" in {change.change_type for change in changes}
 
+    prior = session.exec(select(EventChange).where(EventChange.event_id == event.id,
+                                                   EventChange.change_type == "new_event")).one()
+    prior.digested_at = datetime.now(UTC) - timedelta(days=1)
+    history = DigestRun(digest_date="2026-09-22", status="sent", event_change_ids=[prior.id])
+    session.add(history)
+    session.flush()
+    session.add(DigestDelivery(digest_run_id=history.id, chunk_index=0, body="PREVIOUS EVENT",
+                              event_change_ids=[prior.id], sent_at=prior.digested_at))
+    session.add(prior)
+    session.commit()
+
     cancelled = opened.model_copy(deep=True)
     cancelled.registration_state = RegistrationState.CANCELLED
     terminal, changes, _ = upsert_candidate(
@@ -375,6 +390,8 @@ async def test_lower_trust_rejection_preserves_eligible_event_and_provenance(
     event, _, _ = upsert_candidate(session, candidate, await assess_candidate(candidate, config, organizers))
     previous_reason = event.relevance_reason
     weaker = candidate.model_copy(deep=True)
+    if reason == "unverified_online":
+        weaker.price_text = "Free admission"
     weaker.source_name = "luma_bengaluru"
     weaker.source_url = "https://lu.ma/unverified-crosspost"
     weaker.evidence = SourceEvidence(
@@ -395,7 +412,7 @@ async def test_lower_trust_rejection_preserves_eligible_event_and_provenance(
 
     assert created is False
     assert updated.id == event.id
-    assert updated.status == "eligible"
+    assert updated.status == ("eligible" if initial_price else "needs_review")
     assert updated.price_status == ("free" if initial_price else "not_stated")
     assert updated.price_text == initial_price
     assert updated.eligibility_text is None

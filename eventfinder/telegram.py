@@ -12,7 +12,12 @@ from sqlmodel import Session, select
 
 from eventfinder.config import Settings
 from eventfinder.models import DigestDelivery, DigestRun, Event, EventChange, utcnow
-from eventfinder.repository import mark_changes_digested, pending_changes
+from eventfinder.repository import (
+    mark_changes_digested,
+    notification_allowed,
+    pending_changes,
+    revalidate_notification_policy,
+)
 from eventfinder.urls import safe_outbound_url, same_event_destination
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -328,9 +333,8 @@ class DigestService:
         session.flush()
         return run
 
-    @staticmethod
     def _failed_carry(
-        session: Session, digest_date: str
+        self, session: Session, digest_date: str, now: datetime
     ) -> tuple[list[DigestDelivery], list[EventChange], set[int]]:
         """Recover unsent frozen chunks from the newest unresolved failed day.
 
@@ -360,9 +364,27 @@ class DigestService:
             if not deliveries:
                 # Nothing was frozen or sent; the pending changes can be rendered.
                 continue
-            unsent = [delivery for delivery in deliveries if not delivery.sent_at]
+            self._sanitize_deliveries(session, prior, deliveries, now)
+            unsent = [delivery for delivery in deliveries if not delivery.sent_at and delivery.body]
             if not unsent:
-                mark_changes_digested(session, pending)
+                valid = [change for change, event in self._run_pairs(session, prior)
+                         if change.digested_at is None and notification_allowed(session, event, change, now)]
+                if valid:
+                    mark_changes_digested(session, valid)
+                prior.status = "suppressed" if any(not delivery.body for delivery in deliveries) else "sent"
+                prior.completed_at = utcnow()
+                session.add(prior)
+                session.commit()
+                continue
+            allowed = {change.id for change, event in self._run_pairs(session, prior)
+                       if notification_allowed(session, event, change, now)}
+            pending = [change for change in pending if change.id in allowed]
+            if not pending:
+                # Invalid IDs remain undigested for future factual verification,
+                # but cannot keep already-recovered frozen valid bodies alive.
+                prior.status, prior.completed_at = "suppressed", utcnow()
+                session.add(prior)
+                session.commit()
                 continue
             excluded.update(change.id for change in pending if change.id is not None)
             if unsent and selected is None:
@@ -420,14 +442,16 @@ class DigestService:
         now: datetime, carry: list[DigestDelivery] | None = None,
         carry_ids: list[int] | None = None,
     ) -> dict[str, object]:
-        event_count = len({event.id for _, event in self._run_pairs(session, run)})
+        event_count = len({event.id for change, event in self._run_pairs(session, run)
+                           if notification_allowed(session, event, change, now)})
         if run.status == "sent":
             return {"status": "already_sent", "events": event_count, "chunks": 0}
         deliveries = self._deliveries(session, run, grouped, carry, carry_ids)
+        self._sanitize_deliveries(session, run, deliveries, now)
         self._mark_completed_changes(session, run, deliveries)
         sent = failures = 0
         for delivery in deliveries:
-            if delivery.sent_at or delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS or (
+            if not delivery.body or delivery.sent_at or delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS or (
                 delivery.next_attempt_at and _as_utc(delivery.next_attempt_at) > now
             ):
                 continue
@@ -443,7 +467,7 @@ class DigestService:
             session.add(delivery)
             session.commit()
             self._mark_completed_changes(session, run, deliveries)
-        pending = [d for d in deliveries if not d.sent_at]
+        pending = [d for d in deliveries if not d.sent_at and d.body]
         if pending:
             if all(delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS for delivery in pending):
                 # Permanent failure: leave the underlying EventChanges un-digested so
@@ -462,6 +486,11 @@ class DigestService:
             session.add(run)
             session.commit()
             return {"status": "partial", "events": event_count, "chunks": len(deliveries), "sent": sent, "failures": failures}
+        if deliveries and all(not delivery.body and not delivery.sent_at for delivery in deliveries):
+            run.status, run.completed_at = "suppressed", utcnow()
+            session.add(run)
+            session.commit()
+            return {"status": "suppressed", "events": 0, "chunks": 0, "sent": 0}
         run.status, run.completed_at = "sent", utcnow()
         session.add(run)
         self._mark_completed_changes(session, run, deliveries)
@@ -471,6 +500,7 @@ class DigestService:
     async def _send_daily_digest_locked(self, now: datetime) -> dict[str, object]:
         with self.session_factory() as session:
             self._retain_committed_entities(session)
+            revalidate_notification_policy(session, now=now)
             if self.sender is None:
                 return {"status": "not_configured", "events": 0, "chunks": 0}
             digest_date = _digest_date(now)
@@ -485,10 +515,12 @@ class DigestService:
             current_run = self._run_for_date(session, digest_date)
             if current_run and current_run.status == "sent":
                 return {"status": "already_sent", "events": 0, "chunks": 0}
+            if current_run and current_run.status == "suppressed":
+                return {"status": "suppressed", "events": 0, "chunks": 0}
             if current_run and current_run.status == "failed":
                 return {"status": "failed", "events": 0, "chunks": 0}
-            carry, carried_changes, excluded = self._failed_carry(session, digest_date)
-            pairs = [(change, event) for change, event in pending_changes(session) if change.id not in excluded]
+            carry, carried_changes, excluded = self._failed_carry(session, digest_date, now)
+            pairs = [(change, event) for change, event in pending_changes(session, now) if change.id not in excluded]
             pairs = self._suppress_equivalent_registration_urls(session, pairs)
             pairs = self._suppress_reverted_formats(session, pairs)
             pairs = self._suppress_reverted_schedules(session, pairs)
@@ -502,6 +534,35 @@ class DigestService:
                 session, run, grouped, now, carry,
                 [change.id for change in carried_changes if change.id is not None],
             )
+
+    def _sanitize_deliveries(self, session: Session, run: DigestRun,
+                             deliveries: list[DigestDelivery], now: datetime) -> None:
+        """Re-render policy-invalid frozen retries; never rewrite sent history."""
+
+        pairs = self._run_pairs(session, run)
+        allowed = {change.id for change, event in pairs if notification_allowed(session, event, change, now)}
+        unsent = [delivery for delivery in deliveries if not delivery.sent_at and delivery.body]
+        if not any(set(delivery.event_change_ids if delivery.event_change_ids is not None
+                       else run.event_change_ids) - allowed for delivery in unsent):
+            return
+        ids = {change_id for delivery in unsent for change_id in (
+            delivery.event_change_ids if delivery.event_change_ids is not None else run.event_change_ids
+        )}
+        valid = [(change, event) for change, event in pairs
+                 if change.id in ids & allowed and change.digested_at is None]
+        chunks = _digest_chunks(self._group(valid, self.limit)) if valid else []
+        for index, delivery in enumerate(unsent):
+            delivery.body, delivery.event_change_ids = chunks[index] if index < len(chunks) else ("", [])
+            delivery.error = "Revalidated notification policy"
+            delivery.attempt_count, delivery.next_attempt_at = 0, None
+            session.add(delivery)
+        next_index = max((delivery.chunk_index for delivery in deliveries), default=-1) + 1
+        for index, (body, change_ids) in enumerate(chunks[len(unsent):]):
+            delivery = DigestDelivery(digest_run_id=run.id, chunk_index=next_index + index,
+                                      body=body, event_change_ids=change_ids)
+            session.add(delivery)
+            deliveries.append(delivery)
+        session.commit()
 
     async def send_daily_digest(self, now: datetime | None = None) -> dict[str, object]:
         now = _as_utc(now or utcnow())

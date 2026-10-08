@@ -10,9 +10,29 @@ from urllib.parse import urlsplit
 from sqlalchemy import or_
 from sqlmodel import Session, select
 
-from eventfinder.domain import EventCandidate, RegistrationState, has_explicit_paid_price
-from eventfinder.models import Event, EventChange, EventSource, SourceRun, utcnow
-from eventfinder.policy import Assessment
+from eventfinder.config import FileConfig, get_file_config
+from eventfinder.domain import (
+    EventCandidate,
+    RegistrationState,
+    SourceEvidence,
+    admission_price_status,
+    candidate_admission_statement,
+    candidate_admission_status,
+    event_facts_match,
+    free_only_from_meetup_fee_settings,
+    has_explicit_paid_price,
+    observation_facts,
+)
+from eventfinder.models import (
+    DigestDelivery,
+    DigestRun,
+    Event,
+    EventChange,
+    EventSource,
+    SourceRun,
+    utcnow,
+)
+from eventfinder.policy import Assessment, notification_policy_violation
 from eventfinder.urls import (
     meetup_event_identity_url,
     nvidia_webinar_identity_url,
@@ -70,12 +90,120 @@ def _text_value(value: object) -> str | None:
 
 
 def _price_status(candidate: EventCandidate) -> str:
-    price = (candidate.price_text or "").casefold().strip()
-    if candidate.is_explicitly_paid or has_explicit_paid_price(candidate.price_text):
-        return "paid"
-    if price in {"0", "inr 0", "usd 0", "₹0", "$0"} or any(x in price for x in ("free", "no cost")):
-        return "free"
-    return "not_stated"
+    return candidate_admission_status(candidate)
+
+
+def stored_candidate(event: Event) -> EventCandidate:
+    fields = EventCandidate.model_fields.keys() & Event.model_fields.keys()
+    return EventCandidate(**{field: getattr(event, field) for field in fields},
+        source_name="saved_record", source_url=event.canonical_url,
+        is_explicitly_paid=event.price_status == "paid",
+        evidence=SourceEvidence(source_name="saved_record", source_url=event.canonical_url,
+                                observed_at=event.last_seen_at))
+
+
+def _legacy_unverified_free(session: Session, event: Event) -> bool:
+    """Old semantic parsers converted any page-wide 'free' into a fee fact."""
+
+    if admission_price_status(event.price_text) != "free":
+        return False
+    facts = []
+    for source in session.exec(select(EventSource).where(EventSource.event_id == event.id)):
+        facts.extend(observation_facts(source.evidence))
+    legacy = any(fact.get("legacy_unverified_admission") is True
+                 or (str(fact.get("parser", "")).endswith(":semantic_labels")
+                     and "admission_price" not in fact) for fact in facts)
+    candidate = stored_candidate(event)
+    matching_facts = [fact for fact in facts if event_facts_match(candidate, fact)]
+    verified = any(admission_price_status(fact.get("admission_price")) == "free"
+                   for fact in matching_facts)
+    candidate.evidence.facts["merged_observations"] = [{"facts": fact} for fact in matching_facts]
+    verified = verified or candidate_admission_statement(candidate) is not None
+    for fact in matching_facts:
+        node = fact.get("event", {})
+        if not isinstance(node, dict):
+            continue
+        values = [node.get(key) for key in ("price", "fee", "price_text")]
+        offers = node.get("offers", [])
+        offers = offers if isinstance(offers, list) else [offers]
+        values.extend(offer.get("price") if isinstance(offer, dict) else offer for offer in offers)
+        verified = verified or node.get("isAccessibleForFree") is True or any(
+            admission_price_status(value) == "free" for value in values
+        )
+    return legacy and not verified
+
+
+def event_policy_violation(session: Session, event: Event, config: FileConfig | None = None,
+                           now: datetime | None = None, *, check_time: bool = True) -> tuple[str, str] | None:
+    candidate = stored_candidate(event)
+    candidate.evidence.facts["merged_observations"] = [
+        {"facts": source.evidence}
+        for source in session.exec(select(EventSource).where(EventSource.event_id == event.id))
+    ]
+    violation = notification_policy_violation(candidate, config or get_file_config(),
+                                              _as_utc(now or utcnow()), check_time=check_time)
+    if violation:
+        return violation
+    if _legacy_unverified_free(session, event):
+        return "needs_review", "Legacy free admission lacks event-specific evidence"
+    return None
+
+
+def revalidate_notification_policy(session: Session, config: FileConfig | None = None,
+                                   now: datetime | None = None) -> dict[str, int]:
+    """Recheck saved facts without fetching sources, classifying, or sending."""
+
+    counts = {"checked": 0, "needs_review": 0, "rejected": 0}
+    for event in session.exec(select(Event).where(Event.status == "eligible")).all():
+        counts["checked"] += 1
+        violation = event_policy_violation(session, event, config, now)
+        if not violation:
+            if event.price_status != "free":
+                event.price_status = "free"
+                session.add(event)
+            continue
+        event.status, event.relevance_reason = violation
+        event.price_status = _price_status(stored_candidate(event))
+        if _legacy_unverified_free(session, event):
+            event.price_status = "not_stated"
+        event.updated_at = now or utcnow()
+        session.add(event)
+        counts[event.status] += 1
+    session.commit()
+    return counts
+
+
+def notification_allowed(session: Session, event: Event, change: EventChange,
+                         now: datetime | None = None) -> bool:
+    terminal = event.registration_state in TERMINAL_STATES and change.change_type in {
+        "registration_state", "lifecycle"
+    }
+    if terminal and not _previously_notified(session, event):
+        return False
+    return (event.status == "eligible" or terminal) and event_policy_violation(
+        session, event, now=now, check_time=not terminal
+    ) is None
+
+
+def _previously_notified(session: Session, event: Event) -> bool:
+    """Suppressed changes are not delivery history; require a sent message."""
+
+    change_ids = set(session.exec(select(EventChange.id).where(EventChange.event_id == event.id)))
+    if not change_ids:
+        return False
+    for delivery in session.exec(select(DigestDelivery).where(DigestDelivery.sent_at.is_not(None))):
+        if delivery.event_change_ids is not None:
+            if change_ids.intersection(delivery.event_change_ids):
+                return True
+            continue
+        # Legacy chunks have no attribution. A wholly delivered run proves
+        # its listed changes were sent; a partial run cannot prove which ones.
+        run = session.get(DigestRun, delivery.digest_run_id)
+        if run and change_ids.intersection(run.event_change_ids):
+            chunks = session.exec(select(DigestDelivery).where(DigestDelivery.digest_run_id == run.id)).all()
+            if chunks and all(chunk.sent_at is not None for chunk in chunks):
+                return True
+    return False
 
 
 def _present(value: object, unknown: str | None = None) -> bool:
@@ -159,9 +287,16 @@ def _merge_registration_state(event: Event, candidate: EventCandidate, assessmen
     return False
 
 
-def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assessment) -> None:
+def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assessment,
+                     config: FileConfig | None = None) -> None:
     previous_state = event.registration_state
     trusted_rejection = assessment.status != "rejected" or _candidate_trust_wins(event, assessment)
+    # Meetup's empty fee setting is weak evidence; it never overrides stored paid facts.
+    weak_free = (
+        event.id is not None
+        and (event.price_status == "paid" or has_explicit_paid_price(event.price_text))
+        and free_only_from_meetup_fee_settings(candidate)
+    )
     _merge_scalar(event, "title", candidate.title, assessment)
     for field, value in (
         ("organizer", candidate.organizer), ("description", candidate.description),
@@ -178,7 +313,8 @@ def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assess
     if trusted_rejection:
         _merge_scalar(event, "starts_at", candidate.starts_at, assessment)
         _merge_scalar(event, "ends_at", candidate.ends_at, assessment)
-        _merge_scalar(event, "price_text", candidate.price_text, assessment)
+        if not weak_free:
+            _merge_scalar(event, "price_text", candidate.price_text, assessment)
         _merge_scalar(event, "eligibility_text", candidate.eligibility_text, assessment)
     _merge_scalar(event, "format", candidate.format.value, assessment, RegistrationState.UNKNOWN.value)
     _merge_scalar(event, "event_type", candidate.event_type.value, assessment, "unknown")
@@ -191,7 +327,7 @@ def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assess
     ):
         event.first_observed_open_at = candidate.first_observed_open_at or candidate.evidence.observed_at
     candidate_price = _price_status(candidate)
-    if trusted_rejection and candidate_price != "not_stated" and (event.price_status == "not_stated" or _candidate_trust_wins(event, assessment)):
+    if trusted_rejection and not weak_free and candidate_price != "not_stated" and (event.price_status == "not_stated" or _candidate_trust_wins(event, assessment)):
         event.price_status = candidate_price
     event.speakers = sorted(set(event.speakers) | set(candidate.speakers))
     event.topics = sorted(set(event.topics) | set(candidate.topics))
@@ -221,14 +357,22 @@ def _merge_candidate(event: Event, candidate: EventCandidate, assessment: Assess
     event.last_seen_at = utcnow()
     event.updated_at = utcnow()
     event.normalized_key = normalized_event_key(event)
+    # Evaluate retained facts after a sparse merge. Missing fields still cannot
+    # erase valid evidence, but an old eligible row cannot bypass new gates.
+    retained = stored_candidate(event)
+    if trusted_rejection:
+        retained.evidence = candidate.evidence
+    violation = notification_policy_violation(retained, config or get_file_config(), utcnow())
+    if event.status == "eligible" and violation:
+        event.status, event.relevance_reason = violation
 
 
-def _new_event(candidate: EventCandidate, assessment: Assessment) -> Event:
+def _new_event(candidate: EventCandidate, assessment: Assessment, config: FileConfig | None = None) -> Event:
     event = Event(canonical_url=candidate.canonical_url, normalized_key=normalized_key(candidate), title=candidate.title)
     event.registration_state = "unknown"
     event.price_status = "not_stated"
     event.organizer_trust = "low"
-    _merge_candidate(event, candidate, assessment)
+    _merge_candidate(event, candidate, assessment, config)
     event.first_seen_at = utcnow()
     return event
 
@@ -237,6 +381,24 @@ def _refresh_provenance(session: Session, event: Event, candidate: EventCandidat
     assert event.id is not None
     source = session.exec(select(EventSource).where(EventSource.event_id == event.id, EventSource.source_url == candidate.source_url)).first()
     evidence = {**candidate.evidence.facts, "organizer_trust": assessment.organizer_trust}
+    if source and any(
+        fact.get("legacy_unverified_admission") is True
+        or (str(fact.get("parser", "")).endswith(":semantic_labels") and "admission_price" not in fact)
+        for fact in observation_facts(source.evidence)
+    ):
+        evidence["legacy_unverified_admission"] = True
+    if source and source.evidence.get("admission_review_refresh_at"):
+        evidence["admission_review_refresh_at"] = source.evidence["admission_review_refresh_at"]
+    if _candidate_trust_wins(event, assessment):
+        statement = candidate_admission_statement(candidate)
+        if statement:
+            evidence["admission_statement"] = statement
+        elif source and source.evidence.get("admission_statement"):
+            evidence["admission_statement"] = source.evidence["admission_statement"]
+    if candidate.price_text and _candidate_trust_wins(event, assessment):
+        evidence["admission_price"] = candidate.price_text
+    elif source and source.evidence.get("admission_price"):
+        evidence["admission_price"] = source.evidence["admission_price"]
     if assessment.status == "rejected" and not _candidate_trust_wins(event, assessment):
         unmerged = {
             field: value
@@ -259,21 +421,22 @@ def _refresh_provenance(session: Session, event: Event, candidate: EventCandidat
     event.source_urls = sorted(set([*event.source_urls, candidate.source_url]))
 
 
-def upsert_candidate(session: Session, candidate: EventCandidate, assessment: Assessment) -> tuple[Event | None, list[EventChange], bool]:
+def upsert_candidate(session: Session, candidate: EventCandidate, assessment: Assessment,
+                     config: FileConfig | None = None) -> tuple[Event | None, list[EventChange], bool]:
     """Persist accepted/reviewed candidates and only existing rejected candidates."""
     event = find_existing(session, candidate)
     if event is None and assessment.status == "rejected":
         return None, [], False
     created = event is None
     if event is None:
-        event = _new_event(candidate, assessment)
+        event = _new_event(candidate, assessment, config)
         session.add(event)
         session.flush()
         assert event.id is not None
         changes = [EventChange(event_id=event.id, change_type="new_event", new_value="qualified")]
     else:
         old_values = {field: getattr(event, field) for field in MATERIAL_FIELDS}
-        _merge_candidate(event, candidate, assessment)
+        _merge_candidate(event, candidate, assessment, config)
         session.add(event)
         session.flush()
         assert event.id is not None
@@ -379,7 +542,7 @@ def source_health(session: Session) -> list[dict[str, object]]:
     return [{"source_name": name, "last_started_at": run.started_at, "last_finished_at": run.finished_at, "status": "error" if run.error else "degraded" if run.fetched_count == 0 else "ok", "error": run.error or ("zero candidates" if run.fetched_count == 0 else None), "fetched_count": run.fetched_count, "accepted_count": run.accepted_count} for name, run in sorted(latest.items())]
 
 
-def pending_changes(session: Session) -> list[tuple[EventChange, Event]]:
+def pending_changes(session: Session, now: datetime | None = None) -> list[tuple[EventChange, Event]]:
     result: list[tuple[EventChange, Event]] = []
     for change in session.exec(select(EventChange).where(EventChange.digested_at.is_(None)).order_by(EventChange.observed_at)).all():
         event = session.get(Event, change.event_id)
@@ -390,9 +553,9 @@ def pending_changes(session: Session) -> list[tuple[EventChange, Event]]:
         )
         visible_eligible = event and event.status == "eligible" and (
             not (event.ends_at or event.starts_at)
-            or _as_utc(event.ends_at or event.starts_at) >= utcnow()
+            or _as_utc(event.ends_at or event.starts_at) >= _as_utc(now or utcnow())
         )
-        if visible_eligible or terminal_transition:
+        if (visible_eligible or terminal_transition) and notification_allowed(session, event, change, now):
             result.append((change, event))
     return result
 

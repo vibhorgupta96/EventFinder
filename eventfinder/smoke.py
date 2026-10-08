@@ -38,6 +38,7 @@ async def _run() -> None:
             format=EventFormat.IN_PERSON,
             event_type=EventType.MEETUP,
             registration_state=RegistrationState.OPEN,
+            price_text="Free admission",
             evidence=SourceEvidence(
                 source_name="smoke",
                 source_url="https://events.example.test/ai-systems",

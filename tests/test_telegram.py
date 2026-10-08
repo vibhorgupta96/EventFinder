@@ -42,6 +42,7 @@ def _seed_format_changes(session, current_format: str, changes: list[tuple[str, 
     event = Event(
         canonical_url="https://events.example.test/format-flip",
         normalized_key="format-flip",
+        price_text="Free admission",
         title="Bengaluru Systems Meetup",
         starts_at=datetime.now(UTC) + timedelta(days=8),
         venue="Bengaluru Innovation Center",
@@ -68,6 +69,7 @@ def _seed_schedule_changes(session, starts_at, ends_at, changes):
     event = Event(
         canonical_url="https://events.example.test/schedule-flip",
         normalized_key="schedule-flip",
+        price_text="Free admission",
         title="Bengaluru Systems Meetup",
         starts_at=starts_at,
         ends_at=ends_at,
@@ -94,6 +96,7 @@ def _seed_registration_url_changes(session, current_url, changes):
     event = Event(
         canonical_url="https://events.example.test/registration-link",
         normalized_key="registration-link",
+        price_text="Free admission",
         title="Bengaluru Systems Meetup",
         starts_at=datetime.now(UTC) + timedelta(days=8),
         registration_url=current_url,
@@ -527,8 +530,8 @@ def _seed_long_digest_events(session, count: int = 8):
             normalized_key=f"long-{index}",
             title=f"Long event {index} " + "T" * 300,
             venue="V" * 200,
-            price_status="paid",
-            price_text="P" * 120,
+            price_status="free",
+            price_text="Free admission; " + "P" * 104,
             registration_url=f"https://events.example.test/register/{index}?ticket=" + "X" * 550,
             starts_at=datetime.now(UTC) + timedelta(days=8),
         )
@@ -591,6 +594,7 @@ async def test_event_change_spanning_chunks_clears_only_after_final_chunk(sessio
     event = Event(
         canonical_url="https://events.example.test/spanning",
         normalized_key="spanning",
+        price_text="Free admission",
         title="Spanning event",
         starts_at=datetime.now(UTC) + timedelta(days=8),
         registration_url="https://events.example.test/register?ticket=" + "X" * 8500,
@@ -635,6 +639,7 @@ async def test_legacy_failed_chunks_carry_frozen_unsent_body_across_failed_days(
     event = Event(
         canonical_url="https://events.example.test/legacy",
         normalized_key="legacy",
+        price_text="Free admission",
         title="Old title",
         starts_at=datetime.now(UTC) + timedelta(days=8),
     )
@@ -661,6 +666,7 @@ async def test_legacy_failed_chunks_carry_frozen_unsent_body_across_failed_days(
     fresh_event = Event(
         canonical_url="https://events.example.test/fresh-after-legacy",
         normalized_key="fresh-after-legacy",
+        price_text="Free admission",
         title="Fresh event",
         starts_at=datetime.now(UTC) + timedelta(days=8),
     )
@@ -723,6 +729,7 @@ async def test_cancelled_event_digest_states_cancellation_explicitly(session):
     event = Event(
         canonical_url="https://events.example.test/cancelled",
         normalized_key="cancelled",
+        price_text="Free admission",
         title="Cancelled event",
         starts_at=datetime.now(UTC) + timedelta(days=8),
         registration_state="cancelled",
@@ -730,6 +737,16 @@ async def test_cancelled_event_digest_states_cancellation_explicitly(session):
     )
     session.add(event)
     session.flush()
+    prior = EventChange(event_id=event.id, change_type="new_event", new_value="qualified",
+                        observed_at=datetime(2026, 9, 22, 3, tzinfo=UTC),
+                        digested_at=datetime(2026, 9, 22, 3, tzinfo=UTC))
+    session.add(prior)
+    session.flush()
+    history = DigestRun(digest_date="2026-09-22", status="sent", event_change_ids=[prior.id])
+    session.add(history)
+    session.flush()
+    session.add(DigestDelivery(digest_run_id=history.id, chunk_index=0, body="PREVIOUS EVENT",
+                              event_change_ids=[prior.id], sent_at=prior.digested_at))
     session.add(EventChange(
         event_id=event.id,
         change_type="registration_state",

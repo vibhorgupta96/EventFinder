@@ -4,6 +4,23 @@ EventFinder is a local, read-only service that finds free technical talks, works
 
 It never registers for an event, fills a form, writes to a calendar, imports sibling-project credentials, or bypasses robots rules, CAPTCHAs, authentication, or access controls.
 
+## For reviewers
+
+Start with the [engineering walkthrough](docs/engineering.md) for the ingestion, policy, persistence, and delivery design. The credential-free offline smoke check exercises the local pipeline with synthetic data; it does not start the installed service or send notifications.
+
+```sh
+make install
+make smoke
+```
+
+## Offline reviewer demo
+
+![EventFinder dashboard with visibly labeled synthetic demo events](docs/demo-2026-10-08.jpg)
+
+Preview captured on 8 October 2026 from the isolated offline demo; these are fictional events.
+
+Run `make demo` to open the production dashboard at `http://127.0.0.1:18766` with three visibly labeled synthetic events. It uses explicit empty credentials, an empty source registry, a rejecting HTTP transport, and a temporary SQLite database. The demo does not load `.env`, start the scheduler, fetch sources, call a model, or send Telegram messages. Press Ctrl-C to stop it; the temporary database is removed on shutdown.
+
 ## Quick start
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).

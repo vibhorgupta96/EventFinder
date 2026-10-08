@@ -1,9 +1,9 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install start stop restart status logs smoke smoke-live test lint migrate
+.PHONY: help install start stop restart status logs smoke smoke-live demo test lint migrate
 
 help:
-	@printf "Targets: install start stop restart status logs smoke smoke-live test lint migrate\\n"
+	@printf "Targets: install start stop restart status logs smoke smoke-live demo test lint migrate\\n"
 
 install:
 	uv sync --extra dev
@@ -19,6 +19,9 @@ smoke:
 
 smoke-live:
 	uv run python -m eventfinder.live_smoke
+
+demo:
+	uv run python -m eventfinder.demo
 
 test:
 	uv run pytest -q

@@ -13,6 +13,7 @@
       <p>Technical talks, hands-on events, and hackathons in Bengaluru — plus trusted global online sessions.</p>
     </header>
     <main>
+      {% if demo_label %}<p class="demo-banner" role="status">{{ demo_label }}</p>{% endif %}
       <form id="filter-form" class="filters" aria-label="Filter events">
         <label>Search <input name="text" placeholder="AI, Kubernetes, security…"></label>
         <label>Topic <input name="topic" placeholder="machine learning"></label>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 from sqlalchemy import event
@@ -36,14 +37,26 @@ def make_engine(database_url: str | None = None):
     return engine
 
 
-engine = make_engine()
+@lru_cache(maxsize=1)
+def _default_engine():
+    """Create the configured engine only when the default session is requested."""
+
+    return make_engine()
+
+
+def __getattr__(name: str):
+    """Keep ``from eventfinder.db import engine`` compatible without eager setup."""
+
+    if name == "engine":
+        return _default_engine()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def create_test_db_and_tables(target_engine=None) -> None:
     """Test-only schema helper; production schema changes go through Alembic."""
-    SQLModel.metadata.create_all(target_engine or engine)
+    SQLModel.metadata.create_all(target_engine or _default_engine())
 
 
 def get_session():
-    with Session(engine) as session:
+    with Session(_default_engine()) as session:
         yield session

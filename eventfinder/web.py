@@ -21,6 +21,10 @@ from sqlmodel import Session, select
 
 from eventfinder.ai import make_classifier
 from eventfinder.config import (
+    FileConfig,
+    OrganizersRegistry,
+    Settings,
+    SourcesRegistry,
     get_file_config,
     get_organizers_registry,
     get_settings,
@@ -117,12 +121,18 @@ def create_app(
     start_scheduler: bool = True,
     client: httpx.AsyncClient | None = None,
     fetch_client: httpx.AsyncClient | None = None,
+    settings: Settings | None = None,
+    file_config: FileConfig | None = None,
+    sources_registry: SourcesRegistry | None = None,
+    organizers_registry: OrganizersRegistry | None = None,
+    demo_label: str | None = None,
+    close_injected_clients: bool = False,
 ) -> FastAPI:
-    settings = get_settings()
-    file_config = get_file_config()
-    sources = get_sources_registry()
-    organizers = get_organizers_registry()
-    engine = make_engine(database_url)
+    settings = settings if settings is not None else get_settings()
+    file_config = file_config if file_config is not None else get_file_config()
+    sources = sources_registry if sources_registry is not None else get_sources_registry()
+    organizers = organizers_registry if organizers_registry is not None else get_organizers_registry()
+    engine = make_engine(database_url or settings.sqlalchemy_database_url)
     managed_client = client is None
     managed_fetch_client = fetch_client is None
     # Trusted, fixed-destination integrations (Telegram, Gemini/Groq) never
@@ -157,9 +167,9 @@ def create_app(
                 except asyncio.CancelledError:
                     pass
             scheduler.shutdown()
-            if managed_client:
+            if managed_client or close_injected_clients:
                 await http_client.aclose()
-            if managed_fetch_client:
+            if managed_fetch_client or close_injected_clients:
                 await discovery_client.aclose()
 
     app = FastAPI(title="EventFinder", version="0.1.0", lifespan=lifespan)
@@ -167,6 +177,11 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.discovery = discovery
     app.state.digest = digest
+    app.state.settings = settings
+    app.state.file_config = file_config
+    app.state.sources_registry = sources
+    app.state.organizers_registry = organizers
+    app.state.demo_label = demo_label
     app.mount("/static", StaticFiles(directory=str(PACKAGE_DIR / "static")), name="static")
 
     @app.get("/", response_class=HTMLResponse)
@@ -180,6 +195,7 @@ def create_app(
             {
                 "sections": {name: [_event_payload(event) for event in events] for name, events in sections.items()},
                 "source_health": health,
+                "demo_label": demo_label,
             },
         )
 
